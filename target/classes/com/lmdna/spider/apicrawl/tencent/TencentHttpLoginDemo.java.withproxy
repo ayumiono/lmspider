@@ -1,0 +1,677 @@
+package com.lmdna.spider.api.tencent;
+
+
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStreamWriter;
+import java.io.UnsupportedEncodingException;
+import java.net.URLEncoder;
+import java.sql.SQLException;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.Set;
+import java.util.Vector;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.DelayQueue;
+import java.util.concurrent.Delayed;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.apache.commons.lang.StringUtils;
+import org.apache.http.HttpHost;
+import org.apache.http.ParseException;
+import org.apache.http.client.ClientProtocolException;
+import org.apache.http.client.CookieStore;
+import org.apache.http.client.config.RequestConfig;
+import org.apache.http.client.methods.CloseableHttpResponse;
+import org.apache.http.client.methods.RequestBuilder;
+import org.apache.http.client.protocol.HttpClientContext;
+import org.apache.http.config.SocketConfig;
+import org.apache.http.cookie.Cookie;
+import org.apache.http.impl.client.BasicCookieStore;
+import org.apache.http.impl.client.CloseableHttpClient;
+import org.apache.http.impl.client.HttpClientBuilder;
+import org.apache.http.impl.client.HttpClients;
+import org.apache.http.util.EntityUtils;
+import org.apache.log4j.Level;
+import org.apache.log4j.Logger;
+import org.apache.log4j.PatternLayout;
+import org.apache.log4j.RollingFileAppender;
+
+import us.codecraft.webmagic.Request;
+import us.codecraft.webmagic.thread.CountableThreadPool;
+
+import com.alibaba.fastjson.JSONObject;
+import com.lmdna.spider.utils.VerifyDialog;
+
+public class TencentHttpLoginDemo {
+	
+	private static final Logger logger = Logger.getLogger(TencentHttpLoginDemo.class);
+	
+	private static ExecutorService executorService = Executors.newFixedThreadPool(400);
+	
+	private static CountableThreadPool pool = new CountableThreadPool(400, executorService);
+	
+	private static final BlockingQueue<Request> taskQueue = new LinkedBlockingQueue<Request>();
+	
+	private static final BlockingQueue<String> dbCache = new LinkedBlockingQueue<String>();
+	
+	private static int pageSize = 50000;
+	
+	private static int dealedCount = 0;
+	
+	static{
+		PatternLayout patternLayout = new PatternLayout("%d{yy-MM-dd HH:mm:ss,SSS} %-5p %c(%F:%L) ## %m%n");
+		try {
+			RollingFileAppender fileAppender = new RollingFileAppender(patternLayout,"d:\\log\\tqqinfo.log");
+			fileAppender.setEncoding("gbk");
+			fileAppender.setMaxFileSize("10MB");
+			fileAppender.setMaxBackupIndex(50);
+			fileAppender.setName("tqqinfo");
+			logger.addAppender(fileAppender);
+			logger.setLevel(Level.INFO);
+			logger.setAdditivity(true);
+		} catch (IOException e) {
+			e.printStackTrace();
+		}
+	}
+	
+	private static final BlockingQueue<TencentHttpLoginDemo.TqqConn> connPool = new DelayQueue<TencentHttpLoginDemo.TqqConn>();
+	
+	private static final BlockingQueue<TencentHttpLoginDemo.TqqConn> badconnPool = new DelayQueue<TencentHttpLoginDemo.TqqConn>();
+	
+	private static final Set<String> allAccount = Collections.synchronizedSet(new HashSet<String>());
+	private static final Set<String> badAccount = Collections.synchronizedSet(new HashSet<String>());
+	private static final Set<String> allProxy = Collections.synchronizedSet(new HashSet<String>());
+	
+	private static final Vector<Proxy> badProxy = new Vector<Proxy>();
+	private static final Vector<Proxy> proxyIps = new Vector<Proxy>();
+	
+	private static class TqqConn implements Delayed{
+		private CloseableHttpClient httpclient;
+		private HttpClientContext context;
+		private TqqAccount account;
+		private int canReuseTime=500;
+		private Proxy proxy;
+		public TqqConn(CloseableHttpClient httpclient,HttpClientContext context,TqqAccount account,Proxy proxy){
+			this.httpclient = httpclient;
+			this.context = context;
+			this.account = account;
+			this.proxy = proxy;
+		}
+		public CloseableHttpResponse execute(String url) throws ClientProtocolException, IOException{
+			RequestBuilder builder = RequestBuilder.get().setUri(url);
+			RequestConfig.Builder configBuilder = RequestConfig.custom();
+			configBuilder.setSocketTimeout(3000).setConnectTimeout(3000).setConnectionRequestTimeout(3000);
+			if(proxy!=null){
+				configBuilder.setProxy(proxy.getProxy());
+			}
+			builder.setConfig(configBuilder.build());
+			return httpclient.execute(builder.build(),context);
+		}
+		
+		public void proxyErr(){
+			this.proxy.fail();
+		}
+		public void setProxy(Proxy proxy){
+			this.proxy = proxy;
+		}
+		@Override
+		public int compareTo(Delayed o) {
+			return 0;
+		}
+		@Override
+		public long getDelay(TimeUnit unit) {
+			return unit.convert(canReuseTime - System.nanoTime(), TimeUnit.NANOSECONDS);
+		}
+	}
+	
+	private static class Proxy{
+		private HttpHost proxy;
+		private AtomicInteger errCount = new AtomicInteger(0);
+		private volatile boolean dead =false;
+		public Proxy(HttpHost proxy){
+			this.proxy = proxy;
+		}
+		public HttpHost getProxy() {
+			return proxy;
+		}
+		public void fail(){
+			if(errCount.incrementAndGet() >=100){
+				dead = true;
+			}
+		}
+		public void resetErr(){
+			errCount = new AtomicInteger(0);
+		}
+		public void dead(){
+			dead = true;
+		}
+		public boolean isDead(){
+			return dead;
+		}
+	}
+	
+	private static class TqqAccount{
+		private String account;
+		private String password;
+		public TqqAccount(String account,String password){
+			this.account = account;
+			this.password = password;
+		}
+	}
+	
+	private static class Mythread4 extends Thread{
+		public void run(){
+			for(;;){
+				logger.info("开始同步缓存数据到文件中...");
+				synchronized (dbCache) {
+					logger.info("缓存当前有"+dbCache.size()+"条数据。");
+					try{
+						File file = new File("d:\\data\\qqlog");
+						BufferedOutputStream output = new BufferedOutputStream(new FileOutputStream(file,true));
+						BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(output, "UTF-8"), 1024*1024);
+						while(true){
+							String o = dbCache.poll();
+							if(o==null){
+								break;
+							}
+							writer.write(o+"\r\n");
+						}
+						writer.flush();
+						writer.close();
+					}catch(Exception e){
+						logger.info("同步数据缓存出错!");
+					}
+				}
+				logger.info("同步线程结束，1分钟后重启。");
+				try {
+					Thread.sleep(60*1000);
+				} catch (InterruptedException e) {
+					e.printStackTrace();
+				}
+			}
+		}
+	}
+	
+	private static class Mythread extends Thread{
+		public void run() {
+			for(;;){
+				logger.info("后台检测线程启动。");
+				if(badconnPool.size()>0){
+					logger.info("the size of badconnPool is "+badconnPool.size());
+					while(true){
+						TqqConn conn = badconnPool.poll();
+						if(conn!=null){
+							TqqConn refreshedConn = login(conn.account.account, conn.account.password);
+							connPool.add(refreshedConn);
+							logger.info(conn.account.account+"重新刷新成功，还剩"+badconnPool.size());
+						}else{
+							break;
+						}
+					}
+				}
+				logger.info("后台检测线程结束。1小时后再次启动。");
+				try {
+					Thread.sleep(60*60*1000);
+				} catch (InterruptedException e) {
+					e.printStackTrace();
+				}
+			}
+		}
+	}
+	
+	private static class Mythread3 extends Thread{
+		public void run() {
+			for(;;){
+				logger.info("后台扫描任务文档线程启动。");
+				logger.info("当前任务队列中还有"+taskQueue.size()+"个任务，活跃线程数为"+pool.getThreadAlive()+",坏连接数为"+badconnPool.size()+",数据缓存中有"+dbCache.size()+"条数据。");
+				if(dealedCount >=2200000){
+					break;
+				}
+				if(taskQueue.size()>500000){
+					try {
+						logger.info("任务队列中任务数超过50万个，休息15分钟后再次推任务。");
+						Thread.sleep(15*60*1000);
+					} catch (InterruptedException e) {
+						e.printStackTrace();
+					}
+				}
+				try{
+					logger.info("开始读取第"+dealedCount+"行数据。");
+					File file = new File("d:\\data\\qq");
+					String line = "";
+					BufferedReader breader = null;
+					BufferedInputStream bis = null;
+					bis = new BufferedInputStream(new FileInputStream(file));
+					breader = new BufferedReader(new InputStreamReader(bis, "UTF-8"),1024*1024);
+					int rowno = 0;
+					while((line=breader.readLine())!=null){
+						rowno ++;
+						if(rowno>dealedCount && rowno<=dealedCount+pageSize){
+							String arr2[] = line.split("\t");
+							String ta = arr2[0];
+							String pt2gguinArrStr = arr2[1];
+							pt2gguinArrStr = StringUtils.substringBetween(pt2gguinArrStr,"[","]");
+							String[] pt2gguinArr = pt2gguinArrStr.split(",");
+							for(String pt2gguin : pt2gguinArr){
+								String qq = StringUtils.substringBetween(pt2gguin,"\"o","\"");
+								String url = "http://user.qzone.qq.com/"+qq+"/1";
+								Request request = new Request(url);
+								request.putExtra("ta", ta);
+								taskQueue.add(request);
+							}
+							continue;
+						}else if(rowno>dealedCount+pageSize){
+							dealedCount = dealedCount + pageSize;
+							logger.info("读进内存的行数为"+dealedCount);
+							break;
+						}else if(rowno<dealedCount){
+							continue;
+						}
+					}
+					breader.close();	
+					logger.info("任务文件扫描完成，当前任务队列中有"+taskQueue.size()+"个任务。");
+					logger.info("后台扫描任务文档线程结束。15分钟后再次启动。");
+				}catch(Exception e){
+				}
+				try {
+					Thread.sleep(15*60*1000);
+				} catch (InterruptedException e) {
+					e.printStackTrace();
+				}
+			}
+		}
+	}
+	
+	private static class Mythread5 extends Thread{
+		public void run(){
+			for(;;){
+				logger.info("扫描代理IP线程启动。");
+				BufferedReader breader0 = null;
+				BufferedInputStream bis0 = null;
+				try{
+					File file0 = new File("d:\\data\\proxyip");
+					bis0 = new BufferedInputStream(new FileInputStream(file0));
+					breader0 = new BufferedReader(new InputStreamReader(bis0, "UTF-8"),1024*1024);
+					String proxyinfoLine = "";
+					while((proxyinfoLine=breader0.readLine())!=null){
+						try{
+							String[] proxyinfo = proxyinfoLine.split("\t");
+							String host = proxyinfo[0].trim();
+							String port = proxyinfo[1].trim();
+							String key = host.trim()+":"+port.trim();
+							if(allProxy.contains(key)){
+								logger.info("重复代理IP，跳过！");
+								continue;
+							}else{
+								HttpHost httphost = new HttpHost(host,Integer.valueOf(port));
+								Proxy proxy = new Proxy(httphost);
+								allProxy.add(httphost.toHostString());
+								proxyIps.add(proxy);
+							}
+							logger.info("坏代理IP个数为 "+badProxy.size());
+							for(Proxy proxy : badProxy){
+								proxyIps.add(proxy);
+							}
+							badProxy.clear();
+						}catch(Exception e){
+							continue;
+						}
+					}
+				}catch(Exception e){
+				}
+				logger.info("扫描代理IP线程结束。30分钟后再次启动。");
+				try {
+					Thread.sleep(30*60*1000);
+				} catch (InterruptedException e) {
+					e.printStackTrace();
+				}
+			}
+		}
+	}
+	
+	private static class Mythread2 extends Thread{
+		public void run() {
+			for(;;){
+				logger.info("后台账号登录线程启动。");
+				BufferedReader breader0 = null;
+				BufferedInputStream bis0 = null;
+				try{
+					File file0 = new File("d:\\data\\qqaccount");
+					bis0 = new BufferedInputStream(new FileInputStream(file0));
+					breader0 = new BufferedReader(new InputStreamReader(bis0, "UTF-8"),1024*1024);
+					String accountLine = "";
+					while((accountLine=breader0.readLine())!=null){
+						try{
+							String[] accountinfo = accountLine.split("\t");
+							String account = accountinfo[0].trim();
+							String password = accountinfo[1].trim();
+							if(allAccount.contains(account)){
+								logger.info("重复账号，跳过！");
+								continue;
+							}
+							TqqConn conn = login(account,password);
+							if(conn != null){
+								connPool.add(conn);
+								logger.info("连接池当前有"+connPool.size()+"个连接。");
+								allAccount.add(account);
+							}
+						}catch(Exception e){
+							continue;
+						}
+					}
+				}catch(Exception e){
+				}
+				logger.info("后台账号登录线程结束。1小时后再次启动。");
+				try {
+					Thread.sleep(60*60*1000);
+				} catch (InterruptedException e) {
+					e.printStackTrace();
+				}
+			}
+		}
+	}
+	
+	public static int getACSRFToken(String skey){
+		int hash = 5381;  
+	    for (int i = 0, len = skey.length(); i < len; ++i)  
+	        hash += (hash << 5) + TencentHttpLoginDemo.toUnicode(skey.charAt(i));  
+	    return hash & 2147483647;
+	}
+	
+	public static int toUnicode(char str){
+        int iValue=0;
+        iValue=(int)str;          
+        return iValue;
+    }
+	
+	private static TqqConn login(String account , String password){
+		for(;;){
+			HttpClientBuilder builder = HttpClients.custom().setUserAgent("Mozilla/5.0 (Windows NT 6.1; WOW64; rv:32.0) Gecko/20100101 Firefox/32.0");
+			SocketConfig socketConfig = SocketConfig.custom().setSoKeepAlive(true).setTcpNoDelay(true).build();
+			builder.setDefaultSocketConfig(socketConfig);
+			CloseableHttpClient httpClient = builder.build();
+			HttpClientContext context = HttpClientContext.create();
+			CookieStore cookieStore = new BasicCookieStore();
+			context.setCookieStore(cookieStore);
+			TqqConn conn = new TqqConn(httpClient,context,new TqqAccount(account,password),null);
+			try {
+				String u1 = "";
+				u1 = URLEncoder.encode("http://t.qq.com/", "UTF-8");
+				String loginSigUIURL = "http://ui.ptlogin2.qq.com/cgi-bin/login?appid=716027609&style=13&lang=&low_login=1&hide_title_bar=1&hide_close_icon=1&self_regurl=http%3A//reg.t.qq.com/index.php&s_url="
+						+ u1 + "&daid=6";
+				CloseableHttpResponse response = conn.execute(loginSigUIURL);
+				String login_sig = EntityUtils.toString(response.getEntity());
+				login_sig = StringUtils.substringBetween(login_sig, "login_sig:\"", "\"");
+				String verifyURL = "http://check.ptlogin2.qq.com/check?regmaster=&uin=" + account + "&appid=716027609&js_ver=10060&js_type=1&login_sig=" + login_sig + "&u1=" + u1 + "&r=" + Math.random();
+				String loginURL = "http://ptlogin2.qq.com/login?";
+				String verifyImageUrl = "http://captcha.qq.com/getimage?aid=716027609";
+				String encodeUin = "";
+				String curVerifyCode = "";
+				int verifyCodeRetry = 2;
+				int retryCount = 0;
+				String br = "";
+				String cap_cd="";
+				while (retryCount <= verifyCodeRetry) {
+					response = conn.execute(verifyURL);
+					br = EntityUtils.toString(response.getEntity());
+					String retCode = br.substring(14, 15);
+					if (!retCode.equals("1")) {
+						curVerifyCode = br.substring(18, 22);
+						encodeUin = StringUtils.substringBetween(br, curVerifyCode+"','", "'");
+						break;
+					}else{
+						cap_cd = StringUtils.substringBetween(br, "ptui_checkVC('1','", "'");
+						encodeUin = StringUtils.substringBetween(br, cap_cd+"','", "'");
+					}
+					logger.info(account + ": 请输入验证码...");
+					String curVerifyImageUrl = verifyImageUrl + "&uin=" + account + "&cap_cd=" + cap_cd;
+					response = conn.execute(curVerifyImageUrl);
+		            byte[] image = EntityUtils.toByteArray(response.getEntity());
+		            VerifyDialog dialog = new VerifyDialog(image);
+					dialog.setVisible(true);
+					curVerifyCode = dialog.waitOK();
+					if (!StringUtils.isEmpty(curVerifyCode)) {
+						break;
+					}
+					retryCount++;
+					if (retryCount >= verifyCodeRetry) {
+						break;
+					}
+				}
+				
+				TQQLoginJS tqqLoginJS = new TQQLoginJS();
+				String passwd = tqqLoginJS.getPassword(encodeUin, password, curVerifyCode);
+				String urlEncodeUin = URLEncoder.encode(account, "UTF-8");
+				String curLoginURL = loginURL
+						+ "u="
+						+ urlEncodeUin
+						+ "&p="
+						+ passwd
+						+ "&verifycode="
+						+ curVerifyCode
+						+ "&aid=716027609&u1="
+						+ u1
+						+ "&h=1&ptredirect=1&ptlang=2052&daid=6&from_ui=1&dumy=&low_login_enable=1&low_login_hour=720&regmaster=&fp=loginerroralert&action=25-31-1386760113562&mibao_css=&t=1&g=1&js_ver=10060&js_type=1&login_sig="
+						+ login_sig + "&pt_rsa=0";
+				response = conn.execute(curLoginURL);
+				String responseStr = EntityUtils.toString(response.getEntity());
+				String retCode2 = StringUtils.substringBetween(responseStr, "ptuiCB('", "'");
+				int loginSuccessRetCode = 0;// 登录成功
+				int loginFailedRetCode = 3;// 帐号或密码错误
+				int userNameErrorRetCode = 10;// 帐号不正确
+				int netConnErrorRetCode = 7;// 很遗憾，网络连接出现异常，请您稍后再试。(4042260970)
+				int userLimitRetCode = 19;// 您的号码已被冻结
+				int verifyCodeWrong = 4;//验证码错误
+				int iRetCode = -1;
+				try {
+					iRetCode = Integer.valueOf(retCode2);
+				} catch (NumberFormatException e) {
+					iRetCode = -1;
+				}
+				if (iRetCode == loginSuccessRetCode) {
+					logger.info(account + "登录成功！");
+					return conn;
+				}else if(iRetCode == loginFailedRetCode){
+					logger.info(account + "账号密码错误");
+					return null;
+				}else if(iRetCode == userNameErrorRetCode){
+					logger.info(account + "账号错误");
+					return null;
+				}else if(iRetCode == userLimitRetCode){
+					logger.info(account + "您的号码已被冻结");
+					badAccount.add(account);
+					return null;
+				}else if(iRetCode == netConnErrorRetCode){
+					logger.info("很遗憾，网络连接出现异常，请您稍后再试。");
+					continue;
+				}else if(iRetCode == verifyCodeWrong ){
+					continue;
+				}else{
+					return null;
+				}
+			} catch (UnsupportedEncodingException e1) {
+				continue;
+			} catch (ClientProtocolException e) {
+				continue;
+			} catch (IOException e) {
+				continue;
+			} catch (Exception e){
+				continue;
+			}
+		}
+	}
+
+	public static void main(String arg[]) throws ParseException, IOException, InterruptedException, ClassNotFoundException, SQLException{
+		
+		Thread mythread = new Mythread();
+		Thread mythread2 = new Mythread2();
+		Thread mythread3 = new Mythread3();
+		Thread mythread4 = new Mythread4();
+		Thread mythread5 = new Mythread5();
+		mythread.start();
+		mythread2.start();
+		mythread3.start();
+		mythread4.start();
+		mythread5.start();
+		try {
+			for(;;){
+				final Request request = taskQueue.take();
+				pool.execute(new Runnable(){
+					@Override
+					public void run() {
+						for(;;){
+							TqqConn tqqConn = null;
+							try {
+								tqqConn = connPool.take();
+								Random r = new Random();
+								int index = 0;
+								while(proxyIps.size()<=0){
+									logger.info("代理IP数量为0,等待新的代理IP。");
+									try {
+										Thread.sleep(60*60*1000);
+									} catch (InterruptedException e) {
+										e.printStackTrace();
+									}
+								}
+								index = r.nextInt(proxyIps.size());
+								Proxy proxy = proxyIps.get(index);
+								tqqConn.setProxy(proxy);
+							} catch (InterruptedException e1) {
+								e1.printStackTrace();
+							}
+							String url = request.getUrl();
+							String ta = (String) request.getExtra("ta");
+							try{
+								String uinStr = StringUtils.substringBetween(url, "http://user.qzone.qq.com/", "/1");
+								CloseableHttpResponse response = tqqConn.execute(url);
+								response.close();
+								List<Cookie> cookies = tqqConn.context.getCookieStore().getCookies();
+								String skey="";
+								for(Cookie cookie : cookies){
+									if(cookie.getName().equals("skey")){
+										skey = cookie.getValue();
+									}
+								}
+								int g_tk = TencentHttpLoginDemo.getACSRFToken(skey);
+								String userProfile_url = "http://base.s11.qzone.qq.com/cgi-bin/user/cgi_userinfo_get_all?uin="+uinStr+"&vuin="+tqqConn.account.account+"&fupdate=1&rd="+Math.random()+"&g_tk="+g_tk;
+								response = tqqConn.execute(userProfile_url);
+								String g_userProfile = EntityUtils.toString(response.getEntity());
+								String lmid = ta;
+								String uin = "";
+								String home = "";
+								int marriage = 0;
+								String marriageStr = "";
+								int sex = 0;
+								String sexStr = "";
+								int age = 0;
+								String birthday = "";
+								int birthyear = 0;
+								String location = "";
+								if(!StringUtils.isEmpty(g_userProfile)){
+									String data = StringUtils.substringBetween(g_userProfile,"_Callback(",");");
+									Map<String, Object> json = JSONObject.parseObject(data);
+									int code = (Integer) json.get("code");
+									String message =  (String) json.get("message");
+									if(code == 0 && "获取成功".equals(message)){
+										Map<String, Object> dataMap = (Map<String, Object>) json.get("data");
+										uin = dataMap.get("uin").toString();
+										sex = (Integer) dataMap.get("sex");
+										if(sex == 1){
+											sexStr = "男";
+										}else if(sex == 2){
+											sexStr = "女";
+										}else{
+											sexStr = "";
+										}
+										age = (Integer) dataMap.get("age");
+										birthyear = (Integer) dataMap.get("birthyear");
+										birthday = (String) dataMap.get("birthday");
+										birthday = birthyear + "-" + birthday;
+										String country = (String) dataMap.get("country");
+										String province = (String) dataMap.get("province");
+										String city = (String) dataMap.get("city");
+										String hco = (String) dataMap.get("hco");
+										String hp = (String) dataMap.get("hp");
+										String hc = (String) dataMap.get("hc");
+										home = hco+"@"+hp+"@"+hc;
+										location = country+"@"+province+"@"+city;
+										marriage = (Integer) dataMap.get("marriage");
+										if(marriage == 1){
+											marriageStr = "单身";
+										}else if(marriage == 2){
+											marriageStr = "已婚";
+										}else{
+											marriageStr = "";
+										}
+										String qqInfo = String.format(""
+												+ "{'uin':'%s',"
+												+ "'sex':'%s',"
+												+ "'age':%d,"
+												+ "'birthday':'%s',"
+												+ "'location':'%s',"
+												+ "'home':'%s',"
+												+ "'marriage':'%s',"
+												+ "'lmid':'%s'}", 
+												uin,
+												sexStr,
+												age,birthday,location,home,marriageStr,
+												lmid);
+										dbCache.add(qqInfo);
+										connPool.add(tqqConn);
+										tqqConn.proxy.resetErr();
+										break;
+									}else if(message.contains("请先登录")){
+										tqqConn.proxy.resetErr();
+										logger.info(tqqConn.account.account+ "	"+message);
+										badconnPool.add(tqqConn);
+									}else if(message.contains("服务器繁忙，请稍候再试。")){
+										tqqConn.proxy.dead();
+										logger.info(tqqConn.account.account+ "	"+message);
+										throw new IOException("被屏蔽！");
+									}else{
+										tqqConn.proxy.resetErr();
+										connPool.add(tqqConn);
+										break;
+									}
+								}else{
+									logger.info("g_userProfile为空");
+									connPool.add(tqqConn);
+									break;
+								}
+							}catch(IOException e){
+								if(tqqConn.proxy.isDead()){
+									proxyIps.remove(tqqConn.proxy);
+									logger.info("代理IP级错误，移除代理IP和连接。当前可用代理IP数量为:"+proxyIps.size());
+									badProxy.add(tqqConn.proxy);
+									connPool.add(tqqConn);
+								}else{
+									tqqConn.proxyErr();
+									connPool.add(tqqConn);
+								}
+							}catch(Exception e){
+								connPool.add(tqqConn);
+							}
+						}
+					}
+					
+				});
+			}
+		}catch (Exception e) {
+		} 
+	}
+}

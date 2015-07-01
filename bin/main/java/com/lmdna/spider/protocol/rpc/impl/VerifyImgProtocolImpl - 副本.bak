@@ -1,0 +1,106 @@
+package com.lmdna.spider.protocol.rpc.impl;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.lmdna.spider.dao.SpiderVerifyImgDao;
+import com.lmdna.spider.dao.model.SpiderVerifyImg;
+import com.lmdna.spider.notify.mail.MailSender;
+import com.lmdna.spider.protocol.rpc.VerifyImgProtocol;
+import com.lmdna.spider.utils.SpiderCommonTool;
+import com.lmdna.spider.utils.SpiderConfig;
+
+public class VerifyImgProtocolImpl implements VerifyImgProtocol{
+	
+	private static final Logger logger = LoggerFactory.getLogger(VerifyImgProtocolImpl.class);
+
+	private SpiderVerifyImgDao verifyImgService;
+
+	@Override
+	public String getVerifyCode(String machineid, String source, InputStream data) {
+		String curVerifyCode = "";
+		try{
+			ByteArrayOutputStream swapStream = new ByteArrayOutputStream();
+			byte[] buff = new byte[100];
+			int rc = 0;
+			while ((rc = data.read(buff, 0, 100)) > 0) {
+				swapStream.write(buff, 0, rc);
+			}
+			byte[] bytes = swapStream.toByteArray();
+			if(bytes != null && bytes.length>0){
+				String verify_dir = SpiderConfig.getValue("spider.verifyimg.dir");
+				if (StringUtils.isEmpty(verify_dir)) {
+					logger.error("verify_dir 目录没有指定");
+					throw new Exception("verify_dir 目录没有指定");
+				}
+				String verifyPath = verify_dir;
+				File verifyDir = new File(verifyPath);
+				if(!verifyDir.exists()){
+					verifyDir.mkdirs();
+				}
+				final String localIp = SpiderCommonTool.getLocalIP();
+				String port = SpiderConfig.getValue("server.verifycode.port");
+				if(port==null){
+					port = SpiderConfig.getValue("spider.self.port");
+				}
+				String verifyImageName = "verifyImage_"+System.currentTimeMillis()+".gif";
+				String newVerifyCodeUrl = "http://"+localIp+":"+port+"/verifyimg/"+verifyImageName;
+				File verifyImg = new File(verifyPath + "/" + verifyImageName);
+				try {
+					FileUtils.writeByteArrayToFile(verifyImg, bytes);
+				} catch (IOException e) {
+					e.printStackTrace();
+				}
+				long expire = 1 * 60;//验证码有效时间 1 分钟,单位s
+				Calendar c = Calendar.getInstance();
+				Map<String,Object> parammap = new HashMap<String,Object>();
+				parammap.put("host", machineid);
+				parammap.put("from", source);
+				parammap.put("url", newVerifyCodeUrl);
+				parammap.put("imgcreatetime", new Date());
+				long verifyCodeId = verifyImgService.addVerifyImg(parammap);
+				parammap.clear();
+				//邮件通知
+				MailSender.getInstance().sendException(source+"需要输入验证码","chenguolong@alphaun.com","柠檬爬虫系统（需要输入验证码）");
+				long start = c.getTimeInMillis();
+				long t1 = 0;
+				while(t1 <= expire * 1000){
+					SpiderVerifyImg verifyImgBO = verifyImgService.getVerifyImg(verifyCodeId);
+					if(null != verifyImgBO){
+						String vc = verifyImgBO.getVerifyCode();
+						if(!StringUtils.isEmpty(vc)){
+							curVerifyCode = vc;
+							break;
+						}
+					}
+					long now = System.currentTimeMillis();
+					t1 = now - start;
+					try {
+						Thread.sleep(5000);
+					} catch (InterruptedException e) {
+						e.printStackTrace();
+					}//休息5s
+				}
+				verifyImgService.deleteVerifyImg(verifyCodeId);
+				if (verifyImg.exists()) {
+					verifyImg.delete();
+				}
+			}
+		}catch(Exception e){
+			return curVerifyCode;
+		}
+		return curVerifyCode;
+	}
+
+}

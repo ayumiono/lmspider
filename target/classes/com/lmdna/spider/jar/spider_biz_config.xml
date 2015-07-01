@@ -1,0 +1,119 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<biz id="spider1" code="tqq_individual_info_crawl">
+	<property name="bizCode">
+		<value>tqq_individual_info_crawl</value>
+	</property>
+	<property name="bizName">
+		<value>QQ个人信息抓取</value>
+	</property>
+	<property name="urlRule">
+		<value></value>
+	</property>
+	<property name="persistenceTable">
+		<value>spider_tqq_info</value>
+	</property>
+	<property name="threadCount">
+		<value>80</value>
+	</property>
+	<property name="responseValidCheck">
+		<value></value>
+	</property>
+	<websiteconfig>
+		<website>
+			<property name="charset">
+				<value>utf-8</value>
+			</property>
+			<property name="siteChnName">
+				<value>腾讯</value>
+			</property>
+			<property name="siteEnName">
+				<value>qq</value>
+			</property>
+			<property name="domain">
+				<value>t.qq</value>
+			</property>
+		</website>
+		<property name="needProxy">
+			<value>1</value>
+		</property>
+		<property name="ipReuseInterval">
+			<value>1500</value>
+		</property>
+		<property name="ipStatReportInterval">
+			<value>15</value>
+		</property>
+		<property name="ipReviveinTime">
+			<value>1</value>
+		</property>
+		<property name="failedTimes">
+			<value>5</value>
+		</property>
+		<property name="retryTimes">
+			<value>3</value>
+		</property>
+		<property name="cycleRetryTimes">
+			<value>3</value>
+		</property>
+		<property name="proxyIpCount">
+			<value>200</value>
+		</property>
+		<property name="proxyIpLoadCount">
+			<value>50</value>
+		</property>
+		<property name="deadTimes">
+			<value>2</value>
+		</property>
+		<property name="sleepTime">
+			<value>1500</value>
+		</property>
+		<property name="needLogin">
+			<value>1</value>
+		</property>
+		<property name="loginClass">
+			<value>com.lmdna.spider.apicrawl.tencent.TQQLogin</value>
+		</property>
+		<property name="accountCount">
+			<value>2</value>
+		</property>
+		<property name="accountLoadCount">
+			<value>2</value>
+		</property>
+		<property name="accountReuseInterval">
+			<value>1500</value>
+		</property>
+		<property name="maxVisitPerAccount">
+			<value>1500</value>
+		</property>
+		<property name="maxVisitPerIp">
+			<value>1500</value>
+		</property>
+	</websiteconfig>
+	<fieldrules>
+		<fieldrule name="">
+			<property name="rule">
+				<value></value>
+			</property>
+			<property name="type">
+				<value></value>
+			</property>
+			<property name="allowEmpty">
+				<value></value>
+			</property>
+			<property name="additionRequest">
+				<value></value>
+			</property>
+			<property name="additionDownload">
+				<value></value>
+			</property>
+			<property name="needPersistence">
+				<value></value>
+			</property>
+			<property name="responseValidCheck">
+				<value></value>
+			</property>
+			<children>
+				<child ref=""></child>
+			</children>
+		</fieldrule>	
+	</fieldrules>
+</biz>

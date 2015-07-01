@@ -1,0 +1,228 @@
+package com.lmdna.spider.proxy;
+
+import java.io.Serializable;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.Delayed;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import org.apache.http.HttpHost;
+
+/**    
+ * >>>> Proxy lifecycle 
+ 
+        +----------+     +-----+
+        | last use |     | new |
+        +-----+----+     +---+-+
+              |  +------+   |
+              +->| init |<--+
+                 +--+---+
+                    |
+                    v
+                +--------+
+           +--->| borrow |
+           |    +---+----+
+           |        |+------------------+
+           |        v
+           |    +--------+
+           |    | in use |  Respone Time
+           |    +---+----+
+           |        |+------------------+
+           |        v
+           |    +--------+
+           |    | return |
+           |    +---+----+
+           |        |+-------------------+
+           |        v
+           |    +-------+   reuse interval
+           |    | delay |   (delay time)
+           |    +---+---+
+           |        |+-------------------+
+           |        v
+           |    +------+
+           |    | idle |    idle time
+           |    +---+--+
+           |        |+-------------------+
+           +--------+
+ */
+
+/**
+ * Object has these status of lifecycle above.<br>
+ * 
+ * @author yxssfxwzy@sina.com <br>
+ * @since 0.5.1
+ * @see ProxyPool
+ */
+
+public class Proxy implements Delayed, Serializable {
+
+	private static final long serialVersionUID = 228939737383625551L;
+	public static final int ERROR_403 = 403;
+	public static final int ERROR_404 = 404;
+	public static final int ERROR_BANNED = 10000;// banned by website
+	public static final int ERROR_Proxy = 10001;// the proxy itself failed
+	public static final int SUCCESS = 200;
+	public static final int ERROR_REQUEST_TIME_OUT = 10002;// the target request time out
+	public static final int ERROR_PROXY_TIME_OUT = 10003;//conn to proxyhost time out-->speed is too low
+	public static final int ERROR_DEFAULT = 10009;//other errs
+	
+	private final HttpHost httpHost;
+	
+	private final int id;//对应于spider_proxyip_status表中的唯一id
+	
+	private final int proxyipid;//关联spider_proxyip表中的id
+	
+	private int reuseTimeInterval = 1500;// ms，会根据使用情况自动调整
+	private Long canReuseTime = 0L;
+	private Long lastBorrowTime = System.currentTimeMillis();
+	private Long responseTime = 0L;
+
+	private AtomicInteger failedNum = new AtomicInteger(0);//连续失败次数，每次成功时，会将该值置为0
+	private AtomicInteger successNum = new AtomicInteger(0);//只记录前一周期的成功数
+	private AtomicInteger borrowNum = new AtomicInteger(0);//只记录前一周期的使用数
+	private AtomicInteger deadNum = new AtomicInteger(0);//失效次数
+
+	private List<Integer> failedErrorType = new ArrayList<Integer>();
+
+	public Proxy(HttpHost httpHost,int id,int proxyipid) {
+		this.httpHost = httpHost;
+		this.id = id;
+		this.proxyipid = proxyipid;
+		this.canReuseTime = System.nanoTime() + TimeUnit.NANOSECONDS.convert(reuseTimeInterval, TimeUnit.MILLISECONDS);
+	}
+
+	public Proxy(HttpHost httpHost, int id, int proxyipid, int reuseInterval) {
+		this.httpHost = httpHost;
+		this.id = id;
+		this.proxyipid = proxyipid;
+		this.reuseTimeInterval = reuseInterval;
+		this.canReuseTime = System.nanoTime() + TimeUnit.NANOSECONDS.convert(reuseInterval, TimeUnit.MILLISECONDS);
+	}
+
+	
+	public void resetSuccessNum(){
+		successNum = new AtomicInteger(0);
+	}
+	
+	public void resetBorrowNum(){
+		borrowNum = new AtomicInteger(0);
+	}
+	
+	public void resetFailedNum(){
+		failedNum = new AtomicInteger(0);
+	}
+
+	public void successNumIncrement(int increment) {
+		this.successNum.addAndGet(increment);
+	}
+	
+	public int getSuccessNum() {
+		return successNum.get();
+	}
+	
+	public void fail(int failedErrorType) {
+		this.failedNum.addAndGet(1);
+		this.failedErrorType.add(failedErrorType);
+	}
+
+	public int getFailedNum() {
+		return failedNum.get();
+	}
+	
+	public void borrowNumIncrement(int increment) {
+		this.borrowNum.addAndGet(1);
+	}
+
+	public int getBorrowNum() {
+		return borrowNum.get();
+	}
+	
+	public int getDeadNum() {
+		return deadNum.get();
+	}
+
+	public void dead(){
+		this.deadNum.addAndGet(1);
+	}
+
+	public Long getLastUseTime() {
+		return lastBorrowTime;
+	}
+
+	public void setLastBorrowTime(Long lastBorrowTime) {
+		this.lastBorrowTime = lastBorrowTime;
+	}
+
+	public void recordResponse() {
+		this.responseTime = (System.currentTimeMillis() - lastBorrowTime + responseTime) / 2;
+		this.lastBorrowTime = System.currentTimeMillis();
+	}
+
+	public List<Integer> getFailedErrorType() {
+		return failedErrorType;
+	}
+
+	public void setFailedErrorType(List<Integer> failedErrorType) {
+		this.failedErrorType = failedErrorType;
+	}
+
+	public String getFailedType() {
+		String re = "";
+		for (Integer i : this.failedErrorType) {
+			re += i + " . ";
+		}
+		return re;
+	}
+
+	public HttpHost getHttpHost() {
+		return httpHost;
+	}
+
+	public int getReuseTimeInterval() {
+		return reuseTimeInterval;
+	}
+
+	public void setReuseTimeInterval(int reuseTimeInterval) {
+		this.reuseTimeInterval = reuseTimeInterval;
+		this.canReuseTime = System.nanoTime() + TimeUnit.NANOSECONDS.convert(reuseTimeInterval, TimeUnit.MILLISECONDS);
+
+	}
+
+	@Override
+	public long getDelay(TimeUnit unit) {
+		return unit.convert(canReuseTime - System.nanoTime(), TimeUnit.NANOSECONDS);
+	}
+	
+	public int getId() {
+		return id;
+	}
+	
+	public int getProxyIpId(){
+		return proxyipid;
+	}
+
+	@Override
+	public int compareTo(Delayed o) {
+		Proxy that = (Proxy) o;
+		return canReuseTime > that.canReuseTime ? 1 : (canReuseTime < that.canReuseTime ? -1 : 0);
+
+	}
+
+	@Override
+	public String toString() {
+
+		String re = String.format(
+				"host: %15s >> speed: %5dms >> successrate: %-3.2f%% >> success: %d >> borrow: %d >> reusetimeinterval:%d >> failtimes:%d >> deadtimes:%d", 
+				httpHost.getHostName()+":"+httpHost.getPort(), //ip：port
+				responseTime,//速度
+				borrowNum.get() == 0 ? 0 : successNum.get() * 100.0 / borrowNum.get(), //成功率
+				successNum.get(),
+				borrowNum.get(),//使用次数
+				reuseTimeInterval,//使用间隔
+				failedNum.get(),//连续失败次数
+				deadNum.get());//失效次数
+		return re;
+
+	}
+}

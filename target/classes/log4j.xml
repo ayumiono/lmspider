@@ -1,0 +1,72 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE log4j:configuration SYSTEM "log4j.dtd">
+<log4j:configuration xmlns:log4j="http://jakarta.apache.org/log4j/">
+
+    <appender name="stdout" class="org.apache.log4j.ConsoleAppender">
+        <layout class="org.apache.log4j.PatternLayout">
+            <param name="ConversionPattern" value="%d{yy-MM-dd HH:mm:ss,SSS} %-5p %c(%F:%L) ## %m%n" />
+        </layout>
+        <filter class="org.apache.log4j.varia.LevelRangeFilter">    
+            <param name="levelMin" value="info" />    
+            <param name="levelMax" value="error" />    
+            <param name="AcceptOnMatch" value="true" />    
+        </filter> 
+    </appender>
+    
+    <appender name="info" class="org.apache.log4j.RollingFileAppender">
+    	<param name="File" value="${log.dir}/rootInfo.log" />
+    	<layout class="org.apache.log4j.PatternLayout">
+    		<param name="ConversionPattern" value="%d{yy-MM-dd HH:mm:ss,SSS} %-5p ## %m%n" />
+    	</layout>
+    	<filter class="org.apache.log4j.varia.LevelRangeFilter">    
+            <param name="levelMin" value="info" />    
+            <param name="levelMax" value="info" />    
+            <param name="AcceptOnMatch" value="true" />    
+        </filter> 
+    </appender>
+    
+    <appender name="debug" class="org.apache.log4j.RollingFileAppender">
+    	<param name="File" value="${log.dir}/debug.log" />
+    	<layout class="org.apache.log4j.PatternLayout">
+    		<param name="ConversionPattern" value="%d{yy-MM-dd HH:mm:ss,SSS} %-5p ## %m%n" />
+    	</layout>
+    	<filter class="org.apache.log4j.varia.LevelRangeFilter">    
+            <param name="levelMin" value="debug" />    
+            <param name="levelMax" value="debug" />    
+            <param name="AcceptOnMatch" value="true" />    
+        </filter>  
+    </appender>
+    
+    <appender name="error" class="org.apache.log4j.RollingFileAppender">
+    	<param name="File" value="${log.dir}/error.log" />
+    	<layout class="org.apache.log4j.PatternLayout">
+    		<param name="ConversionPattern" value="%d{yy-MM-dd HH:mm:ss,SSS} %-5p %c(%F:%L) ## %m%n" />
+    	</layout>
+    	<filter class="org.apache.log4j.varia.LevelRangeFilter">    
+            <param name="levelMin" value="error" />    
+            <param name="levelMax" value="error" />    
+            <param name="AcceptOnMatch" value="true" />    
+        </filter>  
+    </appender>
+    
+    <!--- LoggerUtil工具类中继承用 --> 
+    <logger name="info" additivity="false">
+    	<level value="info" />
+    	<appender-ref ref="info" />
+    </logger>
+    <logger name="error" additivity="false">
+    	<level value="error" />
+    	<appender-ref ref="error" />
+    </logger>
+    <!--- LoggerUtil工具类中继承用 --> 
+    <logger name="org.apache" additivity="false">
+    	<level value="error" />
+    	<appender-ref ref="error" />
+    </logger>
+    
+    <root>     
+    	<!-- <appender-ref ref="stdout"/> -->
+        <appender-ref ref="info"/>
+        <appender-ref ref="error"/>
+    </root>
+</log4j:configuration>

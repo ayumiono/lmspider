@@ -1,0 +1,30 @@
+package com.lmdna.spider.pageprocessor;
+
+import com.lmdna.spider.api.tencent.TencentHttpLoginDemo;
+import com.lmdna.spider.downloader.LmdnaStatusfulConnection;
+
+import us.codecraft.webmagic.Page;
+import us.codecraft.webmagic.Site;
+import us.codecraft.webmagic.exception.PageProcessException;
+import us.codecraft.webmagic.processor.PageProcessor;
+
+public class TqqIndividualInfoProcessor implements PageProcessor{
+
+	@Override
+	public void process(Page page) throws PageProcessException {
+		String uin = (String) page.getRequest().getExtra("uin");
+		LmdnaStatusfulConnection conn = (LmdnaStatusfulConnection) page.getConn();
+		String account = conn.getAccountProxy().getAccount();
+		String skey = conn.getHttphelper().getCookie("skey");
+		int g_tk = TencentHttpLoginDemo.getACSRFToken(skey);
+		String userProfile_url = "http://base.s11.qzone.qq.com/cgi-bin/user/cgi_userinfo_get_all?uin="+uin+"&vuin="+account+"&fupdate=1&rd="+Math.random()+"&g_tk="+g_tk;
+		
+	}
+
+	@Override
+	public Site getSite() {
+		// TODO Auto-generated method stub
+		return null;
+	}
+
+}

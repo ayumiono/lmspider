@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE sqlMap
+PUBLIC "-//ibatis.apache.org//DTD SQL Map 2.0//EN"
+    "http://ibatis.apache.org/dtd/sql-map-2.dtd">
+<sqlMap namespace="spiderWebsite">
+	<typeAlias alias="spiderWebsite" type="com.lmdna.spider.dao.model.SpiderWebsite" />
+	<select id="getWebsiteById" parameterClass="int" resultClass="spiderWebsite">
+		select * from spider_website where id=#value#
+	</select>
+	<insert id="addWebsite" parameterClass="spiderWebsite">
+		insert into spider_website(sitechnname,siteenname,domain,charset) values
+		(#siteChnName#,#siteEnName#,#domain#,#charset#)
+		<selectKey resultClass ="int" keyProperty="id">
+			select @@identity as inserted
+		</selectKey>
+	</insert>
+	<select id="getAllWebsite" resultClass="spiderWebsite">
+		select * from spider_website
+	</select>
+	<select id="getWebsite" parameterClass="spiderWebsite" resultClass="spiderWebsite">
+		select * from spider_website
+		<dynamic prepend="where">
+			<isNotNull property="id" prepend="and">
+				id=#id#
+			</isNotNull>
+			<isNotNull property="siteEnName" prepend="and">
+				siteenname=#siteEnName#
+			</isNotNull>
+			<isNotNull property="siteChnName" prepend="and">
+				sitechnname=#siteChnName#
+			</isNotNull>
+			<isNotNull property="domain" prepend="and">
+				domain=#domain#
+			</isNotNull>
+		</dynamic>
+	</select>
+</sqlMap>

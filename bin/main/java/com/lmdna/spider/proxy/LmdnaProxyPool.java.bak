@@ -1,0 +1,482 @@
+package com.lmdna.spider.proxy;
+
+import java.util.ArrayList;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Map.Entry;
+import java.util.NoSuchElementException;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.DelayQueue;
+
+import local.utils.mail.MailSender;
+
+import org.apache.http.HttpHost;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import us.codecraft.webmagic.Request;
+import us.codecraft.webmagic.proxy.Proxy;
+import us.codecraft.webmagic.proxy.ProxyPool;
+import us.codecraft.webmagic.utils.LoggerUtil;
+import us.codecraft.webmagic.utils.ProxyUtils;
+
+import com.ailami.lemon.dao.model.SpiderAntiMonitorPolicy;
+import com.ailami.lemon.dao.model.SpiderBiz;
+import com.ailami.lemon.dao.model.SpiderProxyIp;
+import com.lmdna.spider.SpiderDAOServiceFacade;
+
+
+/**
+ * @author ayumi
+ */
+public class CopyOfLmdnaProxyPool extends ProxyPool{
+
+    //private Logger logger = LoggerFactory.getLogger(getClass());
+    
+    private SpiderDAOServiceFacade facade;
+    
+    private BlockingQueue<LmdnaProxy> proxyQueue = new DelayQueue<LmdnaProxy>();
+    
+    private BlockingQueue<LmdnaProxy> reviveProxyQueue = new DelayQueue<LmdnaProxy>();
+    //key:ip:port
+    private Map<String, LmdnaProxy> allProxy = new ConcurrentHashMap<String, LmdnaProxy>();
+    //代理IP黑名单
+    private Map<String, LmdnaProxy> blackProxy = new ConcurrentHashMap<String, LmdnaProxy>();
+    
+    private SpiderBiz biz;//标识业务种别
+    private SpiderAntiMonitorPolicy antiMonitorPolicy;//反监控规则
+
+    //如果之后做成页面可控，这几个参数要确保线程安全
+    private volatile int reuseInterval = 1000;// 反监控规则_请求间隔 ms
+    private volatile int reviveTime = 60*60*1000;// 反监控规则_复活时间 d
+    private volatile int saveProxyInterval = 60*1000;// 代理IP使用情况监控 h
+    
+    private static final int checkProxyCountInterval = 10*60*1000;
+    
+    private boolean isEnable = false;
+    private boolean validateWhenInit = true;
+    private Timer timer1 = new Timer(true);
+    private Timer timer2 = new Timer(true);
+    //定期提交代理IP使用情况
+    private TimerTask saveProxyTask = new TimerTask() {
+        @Override
+        public void run() {
+        	if(allProxy.size()>0){
+        		saveProxyList();
+        		LoggerUtil.info(getLogName(), getClass().toString(), allProxyStatus());
+                resetAllProxy();
+        	}
+        }
+    };
+    //定期检查代理IP数量是否充足
+    private TimerTask checkProxyCountTask = new TimerTask(){
+		@Override
+		public void run() {
+			checkProxyCount();
+		}
+    	
+    };
+    
+    public CopyOfLmdnaProxyPool(SpiderDAOServiceFacade facade,SpiderBiz biz,SpiderAntiMonitorPolicy antiMonitorPolicy) {
+    	this.facade = facade;
+    	this.antiMonitorPolicy = antiMonitorPolicy;
+    	this.reuseInterval = antiMonitorPolicy.getIpReuseInterval();
+    	this.reviveTime = antiMonitorPolicy.getIpReviveinTime()*60*60*1000;//小时转为毫秒
+    	this.saveProxyInterval = antiMonitorPolicy.getIpStatReportInterval()*60*1000;//分钟转为毫秒
+    	this.biz = biz;
+    	logger.info("{}>>>初始加载代理IP...",biz.getBizName());
+    	loadProxy(true);
+    	timer1.schedule(saveProxyTask, 0, saveProxyInterval);
+    	timer2.schedule(checkProxyCountTask, checkProxyCountInterval, checkProxyCountInterval);
+    }
+
+    private void saveProxyList() {
+        if (allProxy.size() == 0) {
+            return;
+        }
+        logger.info("开始提交代理ip使用情况...");
+        Map<String,Object> updateMap = new HashMap<String,Object>();
+        for(Entry<String,LmdnaProxy> entry : allProxy.entrySet()){
+    		try{
+    			updateMap.put("id", entry.getValue().getId());
+        		updateMap.put("failedNum", entry.getValue().getFailedNum());
+        		updateMap.put("successNum", entry.getValue().getSuccessNum());
+        		updateMap.put("borrowNum", entry.getValue().getBorrowNum());
+        		updateMap.put("deadNum", entry.getValue().getDeadNum());
+        		updateMap.put("updatetime", new Date());
+        		updateMap.put("reuseinterval", entry.getValue().getReuseTimeInterval());
+        		facade.updateProxyIpStatus(updateMap);
+        		updateMap.clear();
+    		}catch(Exception e){
+    			logger.info("{}>>>{}使用情况提交失败！",biz.getBizName(),entry.getKey());
+            	logger.error(biz.getBizName()+">>>代理ip"+entry.getKey()+"使用情况提交失败！", e);
+    			continue;
+    		}
+    	}
+        logger.info("{} >>> 黑名单中有{}个代理IP.",biz.getBizName(),blackProxy.size());
+        for(Entry<String,LmdnaProxy> entry : blackProxy.entrySet()){
+        	try{
+    			int proxyipid = entry.getValue().getProxyIpId();
+    			int id = entry.getValue().getId();
+    			String ip = entry.getValue().getHttpHost().getHostName();
+    			int port = entry.getValue().getHttpHost().getPort();
+    			String bizid = biz.getId();
+    			facade.saveBlackProxyIp(String.valueOf(proxyipid), ip, port, bizid);
+    			facade.delProxyIpStatus(String.valueOf(id));
+    		}catch(Exception e){
+    			logger.info(biz.getBizName()+entry.getKey()+"代理IP加入黑名单失败！");
+            	logger.error(biz.getBizName()+entry.getKey()+"代理ip加入黑名单失败！", e);
+    			continue;
+    		}
+        }
+        blackProxy.clear();
+        logger.info("{}代理ip使用情况提交完成！",biz.getBizName());
+    }
+    
+    private void checkProxyCount(){
+    	logger.info("{} >>> 检查代理IP池数量",biz.getBizName());
+    	if(allProxy.size()<antiMonitorPolicy.getProxyIpCount()){
+    		logger.info("{} >>> 可用代理IP还剩{}个，数量不足，加载更多的代理IP...",biz.getBizName(),allProxy.size());
+    		loadProxy(false);
+    	}
+    }
+    
+    private Map<String, LmdnaProxy> resetAllProxy() {
+        Map<String, LmdnaProxy> tmp = new HashMap<String, LmdnaProxy>();
+        for (Entry<String, LmdnaProxy> e : allProxy.entrySet()) {
+        	LmdnaProxy p = e.getValue();
+            p.resetSuccessNum();
+            p.resetBorrowNum();
+            tmp.put(e.getKey(), p);
+        }
+        return tmp;
+    }
+
+    
+    /**
+     * 读取代理IP资源
+     * 1.池初始化时调用
+     * 2.池中没有可用代理IP里调用
+     */
+    private void loadProxy(boolean firstLoad) {
+        try{
+        	
+        	if(allProxy.size()<antiMonitorPolicy.getProxyIpCount()){
+        		logger.info("{} >>> 需要补充代理IP，开始加载代理IP...",biz.getBizName());
+        		Map<String, LmdnaProxy> httpProxyMap = new HashMap<String,LmdnaProxy>();
+        		
+        		//先从reviveProxyQueue中拿 
+        		LmdnaProxy reviveProxy = null;
+        		reviveProxy = reviveProxyQueue.poll();
+        		if(reviveProxy!=null){
+        			reviveProxy.setReuseTimeInterval(reuseInterval);
+        			httpProxyMap.put(reviveProxy.getHttpHost().toHostString(),reviveProxy);
+        			logger.info("{} >>> 失效代理IP：{} 被重新激活。", biz.getBizName(),reviveProxy.getHttpHost().toHostString());
+        		}
+        		
+        		int loadcount = 0;
+        		if(firstLoad){
+        			loadcount = antiMonitorPolicy.getProxyIpCount();
+        		}else{
+        			loadcount = antiMonitorPolicy.getProxyIpLoadCount();
+        		}
+        		
+        		List<SpiderProxyIp> proxyIpList = new ArrayList<SpiderProxyIp>();
+            	proxyIpList = facade.getValidProxyIps(biz.getId());
+            	//匹配allProxy中的IP，只取不存在的
+            	for(SpiderProxyIp proxyIp : proxyIpList){
+            		HttpHost host = new HttpHost(proxyIp.getIp(),proxyIp.getPort());
+            		String key = host.toHostString();
+            		if(allProxy.containsKey(key) || blackProxy.containsKey(key)){
+            			continue;
+            		}else{
+            			if (!validateWhenInit || ProxyUtils.validateProxy(host)) {
+                			int id = addProxyIpStatus(proxyIp.getId(),biz.getId(),proxyIp.getIp(),proxyIp.getPort());
+                			LmdnaProxy proxy = new LmdnaProxy(host,id,Integer.valueOf(proxyIp.getId()),reuseInterval);
+                			httpProxyMap.put(key, proxy);
+                			--loadcount;
+                    		if(loadcount == 0){
+                    			break;
+                    		}
+                        }else{
+                        	logger.info("代理IP{}不可用，将不会被加载到IP池中。",host.toHostString());
+                        }
+            		}
+            	}
+            	if(httpProxyMap.size()==0){
+            		logger.info(biz.getBizName()+"没有新的代理IP可供添加！");
+            		//发代理IP不足通知
+            		MailSender.getInstance().sendException(String.format("业务%s  <span style='color:red'>代理IP不足！</span><br>"
+            				+ "当前可用代理IP数为<span style='color:red'>%d</span>个，该业务允许最低代理IP数为<span style='color:green'>%d</span>个<br>"
+            				+ "请及时添加代理IP", biz.getBizName(),allProxy.size(),antiMonitorPolicy.getProxyIpCount()), "chenxuelong@alphaun.com", "柠檬爬虫系统异常（代理IP不足！）");
+            		return;
+            	}
+            	addProxy(httpProxyMap);
+            	logger.info("{} >>> 加载代理IP完成！代理IP池规模:{}",biz.getBizName(),allProxy.size());
+        	}
+        	
+        }catch(Exception e){
+        	logger.info(biz.getBizName()+"加载代理IP失败！");
+        	logger.error(biz.getBizName()+"加载代理IP失败！",e);
+        }
+    }
+
+    private void addProxy(Map<String, LmdnaProxy> httpProxyMap) {
+        isEnable = true;
+        for (Entry<String, LmdnaProxy> entry : httpProxyMap.entrySet()) {
+            try {
+                if (allProxy.containsKey(entry.getKey())) {
+                    continue;
+                }else{
+                	proxyQueue.add(entry.getValue());
+                    allProxy.put(entry.getKey(), entry.getValue());
+                }
+            } catch (NumberFormatException e) {
+                logger.error("HttpHost init error:", e);
+            }
+        }
+    }
+    
+    /* 
+     * 获取代理IP，每次获取时顺便检查一下当前可用代理IP的数量，若低于阀值，loadProxy()
+     */
+    public LmdnaProxy getProxy() {
+    	LmdnaProxy proxy = null;
+        try {
+            Long time = System.currentTimeMillis();
+            logger.debug("{} taking proxy ip form proxypool, current size:{}",Thread.currentThread().getName(),proxyQueue.size());
+            proxy = proxyQueue.take();
+            logger.debug("{} take proxy ip form proxypool success: {}",Thread.currentThread().getName(),proxy.getHttpHost().toHostString());
+            double costTime = (System.currentTimeMillis() - time) / 1000.0;
+            if (costTime > reuseInterval) {
+                logger.info("{} >>> get proxy time >>>> {}",biz.getBizName(),costTime);
+            }
+            LmdnaProxy p = allProxy.get(proxy.getHttpHost().toHostString());
+            p.setLastBorrowTime(System.currentTimeMillis());
+            p.borrowNumIncrement(1);
+        } catch (InterruptedException e) {
+            logger.error("get proxy error", e);
+        }
+        if (proxy == null) {
+            throw new NoSuchElementException();
+        }
+        return proxy;
+    }
+
+    public void returnProxy(Proxy proxy, int statusCode) {
+    	HttpHost host = proxy.getHttpHost();
+    	LmdnaProxy p = allProxy.get(host.toHostString());
+    	try{
+            if (p == null) {
+            	logger.warn("归还代理IP{}时,没有找到归还对象副本！！！！！！！！",host.toHostString());
+                return;
+            }
+            switch (statusCode) {
+                case LmdnaProxy.SUCCESS:
+                    p.setReuseTimeInterval(reuseInterval);
+                    p.resetFailedNum();
+                    p.resetDeadNum();
+                    p.setFailedErrorType(new ArrayList<Integer>());
+                    p.recordResponse();
+                    p.successNumIncrement(1);
+                    break;
+                case LmdnaProxy.ERROR_403:
+                    p.fail(LmdnaProxy.ERROR_403);
+                    p.setReuseTimeInterval(reuseInterval * p.getFailedNum());
+                    logger.info("{} >>>> 错误码为{}。>>>> 目前失败次数{},改变使用间隔为{}秒",host.toHostString(),LmdnaProxy.ERROR_403,p.getFailedNum(),p.getReuseTimeInterval() / 1000.0);
+                    break;
+                case LmdnaProxy.ERROR_500:
+                	p.fail(LmdnaProxy.ERROR_500);
+                    p.setReuseTimeInterval(reuseInterval * p.getFailedNum());
+                    logger.info("{} >>>> 错误码为{}。>>>> 目前失败次数{},改变使用间隔为{}秒",host.toHostString(),LmdnaProxy.ERROR_500,p.getFailedNum(),p.getReuseTimeInterval() / 1000.0);
+                    break;
+                case LmdnaProxy.ERROR_BANNED:
+                    p.dead();
+                    p.setReuseTimeInterval(reviveTime);
+                    allProxy.remove(host.toHostString());
+                    reviveProxyQueue.add(p);
+                    logger.info("{} 被列为濒危代理IP,将在一段时间后复活。  >>>> 错误记录：{} >>> 前一个周期内成功次数为{}次，连续失败次数为{}次！ 目前可用代理IP还剩{}个",host.toHostString(),p.getFailedType(),p.getSuccessNum(),p.getFailedNum(),allProxy.size());
+                    return;
+                case LmdnaProxy.ERROR_404:
+                    p.fail(LmdnaProxy.ERROR_404);
+                    p.setReuseTimeInterval(reuseInterval * p.getFailedNum());
+                    logger.info("{} >>>> 错误码为{}。>>>> 目前失败次数{},改变使用间隔为{}秒",host.toHostString(),LmdnaProxy.ERROR_404,p.getFailedNum(),p.getReuseTimeInterval() / 1000.0);
+                    break;
+                case LmdnaProxy.ERROR_Proxy://代理IP异常HttpHostConnectException
+                	if(!ProxyUtils.validateProxy(host,3,p.getSocketTimeout())){
+                		//称除无效的代理IP
+                    	allProxy.remove(host.toHostString());
+                    	facade.delProxyIp(String.valueOf(p.getProxyIpId()));
+                    	facade.delProxyIpStatus(String.valueOf(p.getId()));
+                        logger.info("{} 被检测为无效代理IP,将被移除！前一个周期内成功次数为{}次，连续失败次数为{}次！目前可用代理IP还剩{}个",host.toHostString(),p.getSuccessNum(),p.getFailedNum(),allProxy.size());
+                        return;
+                	}else{
+                		p.fail(LmdnaProxy.ERROR_Proxy);
+                		logger.info("{} >>>> 错误码为{}。>>>> 目前失败次数{},改变使用间隔为{}秒",host.toHostString(),LmdnaProxy.ERROR_Proxy,p.getFailedNum(),p.getReuseTimeInterval() / 1000.0);
+                	}
+                case LmdnaProxy.ERROR_PROXY_TIME_OUT://代理IP异常ConnectTimeoutException
+                	if(!ProxyUtils.validateProxy(host,3,p.getSocketTimeout())){
+                		//称除无效的代理IP
+                    	allProxy.remove(host.toHostString());
+                    	facade.delProxyIp(String.valueOf(p.getProxyIpId()));
+                        facade.delProxyIpStatus(String.valueOf(p.getId()));
+                    	logger.info("{} 被检测为无效代理IP,将被移除！前一个周期内成功次数为{}次，连续失败次数为{}次！目前可用代理IP还剩{}个",host.toHostString(),p.getSuccessNum(),p.getFailedNum(),allProxy.size());
+                        return;
+                	}else{
+                		p.fail(LmdnaProxy.ERROR_PROXY_TIME_OUT);
+                		p.setReuseTimeInterval(reuseInterval * p.getFailedNum());
+                    	p.setSocketTimeout(p.getSocketTimeout() + p.getFailedNum()*1000);
+                    	logger.info("{} >>>错误码为{} >>> 改变conntimeout为{}秒",host.toHostString(),LmdnaProxy.ERROR_PROXY_TIME_OUT,p.getSocketTimeout() / 1000.0);
+                	}
+                case LmdnaProxy.ERROR_SOCKET_READ_TIME_OUT://代理IP异常SocketTimeoutException
+                	if(!ProxyUtils.validateProxy(host,3,p.getSocketTimeout())){
+                		//称除无效的代理IP
+                    	allProxy.remove(host.toHostString());
+                    	facade.delProxyIp(String.valueOf(p.getProxyIpId()));
+                    	facade.delProxyIpStatus(String.valueOf(p.getId()));
+                        logger.info("{} 被检测为无效代理IP,将被移除！前一个周期内成功次数为{}次，连续失败次数为{}次！目前可用代理IP还剩{}个",host.toHostString(),p.getSuccessNum(),p.getFailedNum(),allProxy.size());
+                        return;
+                	}else{
+                		p.fail(LmdnaProxy.ERROR_SOCKET_READ_TIME_OUT);
+                		p.setReuseTimeInterval(reuseInterval * p.getFailedNum());
+                    	p.setSocketTimeout(p.getSocketTimeout() + p.getFailedNum()*1000);
+                    	logger.info("{} >>>错误码为{} >>> 改变sockettimeout为{}秒",host.toHostString(),LmdnaProxy.ERROR_SOCKET_READ_TIME_OUT,p.getSocketTimeout() / 1000.0);
+                	}
+                case Request.ERROR_ILLEGAL_REQUEST_URI://url格式错误，不做任何处理
+                	break;
+                default:
+                    p.fail(statusCode);
+                    p.setReuseTimeInterval(reuseInterval * p.getFailedNum());
+                    break;
+            }
+            
+            if (p.getFailedNum() > antiMonitorPolicy.getFailedTimes()) {
+            	//没有通过检测 /超出失效次数阀值
+            	if(!ProxyUtils.validateProxy(host,3,p.getSocketTimeout())){
+            		//称除无效的代理IP
+                	allProxy.remove(host.toHostString());
+                	facade.delProxyIp(String.valueOf(p.getProxyIpId()));
+                	facade.delProxyIpStatus(String.valueOf(p.getId()));
+                    logger.info("{} 被检测为无效代理IP,将被移除！前一个周期内成功次数为{}次，连续失败次数为{}次！目前可用代理IP还剩{}个",host.toHostString(),p.getSuccessNum(),p.getFailedNum(),allProxy.size());
+                    return;
+            	}else if(p.getDeadNum() < antiMonitorPolicy.getDeadTimes()){
+            		p.dead();
+                    p.setReuseTimeInterval(reviveTime);
+                    allProxy.remove(host.toHostString());
+                    reviveProxyQueue.add(p);
+                    logger.info("{} 被列为濒危(dead)代理IP,将在一段时间后复活。  >>>> 错误记录{} >>> 目前可用代理IP还剩{}个",host.toHostString(),p.getFailedType(),allProxy.size());
+                    return;
+            	}else{
+            		//加入代理IP黑名单
+                	allProxy.remove(host.toHostString());
+                	blackProxy.put(host.toHostString(), p);
+                    logger.info("{} 被封了！将被放入黑名单。 >>> 错误记录{} >>> 目前可用代理IP还剩{}个",host.toHostString(),p.getFailedType(),allProxy.size());
+                    return;
+            	}
+            }
+            
+            try {
+                proxyQueue.put(p);
+            } catch (InterruptedException e) {
+                logger.error(biz.getBizName()+"proxyQueue return proxy error", e);
+            }
+    	}finally{
+    		logger.debug("{}归还代理IP{}结束。",Thread.currentThread().getName(),host.toHostString());
+    	}
+    	
+    }
+
+    public String allProxyStatus() {
+        String re = "all proxy info >>>> \r\n";
+        for (Entry<String, LmdnaProxy> entry : allProxy.entrySet()) {
+            re += entry.getValue().toString() + "\r\n";
+        }
+        return re;
+    }
+    
+    private int addProxyIpStatus(String proxyipid,String bizid,String ip,int port){
+    	try{
+    		return Integer.parseInt(facade.addProxyIpStatus(proxyipid, bizid, ip, port).getId());
+    	}catch(Exception e){
+    		return 0;
+    	}
+    }
+    
+    public int getIdleNum() {
+        return proxyQueue.size();
+    }
+    
+    public int getTotalNum(){
+    	return allProxy.size();
+    }
+
+    public int getReuseInterval() {
+        return reuseInterval;
+    }
+
+    public void setReuseInterval(int reuseInterval) {
+        this.reuseInterval = reuseInterval;
+    }
+
+    public void enable(boolean isEnable) {
+        this.isEnable = isEnable;
+    }
+
+    public boolean isEnable() {
+        return isEnable;
+    }
+
+    public int getReviveTime() {
+        return reviveTime;
+    }
+
+    public void setReviveTime(int reviveTime) {
+        this.reviveTime = reviveTime;
+    }
+
+    public boolean isValidateWhenInit() {
+        return validateWhenInit;
+    }
+
+    public void validateWhenInit(boolean validateWhenInit) {
+        this.validateWhenInit = validateWhenInit;
+    }
+
+    public int getSaveProxyInterval() {
+        return saveProxyInterval;
+    }
+
+    public void setSaveProxyInterval(int saveProxyInterval) {
+        this.saveProxyInterval = saveProxyInterval;
+    }
+    
+    public String getLogName(){
+    	return biz.getBizCode();
+    }
+    
+    public static void main(String arg[]){
+    	SpiderBiz biz = new SpiderBiz();
+    	SpiderAntiMonitorPolicy antiMonitorPolicy = new SpiderAntiMonitorPolicy();
+    	antiMonitorPolicy.setIpReuseInterval(1000);
+    	antiMonitorPolicy.setIpReviveinTime(10000);
+    	antiMonitorPolicy.setIpStatReportInterval(5);
+    	CopyOfLmdnaProxyPool proxyPool = new CopyOfLmdnaProxyPool(null, biz, antiMonitorPolicy);
+    	Map<String, LmdnaProxy> httpProxyMap = new HashMap<String, LmdnaProxy>();
+    	for(int i=0;i<500;i++){
+    		HttpHost host = new HttpHost(String.valueOf(i),i);
+    		LmdnaProxy proxy = new LmdnaProxy(host,i,i,1000+i*10);
+    		httpProxyMap.put(String.valueOf(i), proxy);
+    	}
+    	proxyPool.addProxy(httpProxyMap);
+    	for(;;){
+    		System.out.println(proxyPool.getProxy().toString());
+    	}
+    }
+    
+}

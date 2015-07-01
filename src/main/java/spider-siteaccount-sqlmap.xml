@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE sqlMap
+PUBLIC "-//ibatis.apache.org//DTD SQL Map 2.0//EN"
+    "http://ibatis.apache.org/dtd/sql-map-2.dtd">
+<sqlMap namespace="spiderWebsiteAccount">
+	<typeAlias alias="spiderWebsiteAccount"
+		type="com.lmdna.spider.dao.model.SpiderWebsiteAccount" />
+	<select id="selectWebsiteAccounts" parameterClass="Map" resultClass="spiderWebsiteAccount">
+		select * from spider_website_account 
+		<dynamic prepend="where">
+			<isNotNull prepend="and" property="site">
+				site=#site#
+			</isNotNull>
+			<isNotNull prepend="and" property="valid">
+				valid=#valid#
+			</isNotNull>
+		</dynamic>
+	</select>
+	<update id="invalidWebsiteAccounts" parameterClass="Map">
+		update spider_website_account set updatetime=now()
+		<isNotNull prepend="," property="valid">
+			valid=#valid#
+		</isNotNull>
+		<isNotNull prepend="," property="msg">
+			msg=#msg#
+		</isNotNull>
+		<dynamic prepend="where">
+			<isNotNull prepend="and" property="account">
+				account=#account#
+			</isNotNull>
+			<isNotNull prepend="and" property="password">
+				password=#password#
+			</isNotNull>
+			<isNotNull prepend="and" property="site">
+				site=#site#
+			</isNotNull>
+			<isNotNull prepend="and" property="id">
+				id=#id#
+			</isNotNull>
+		</dynamic>
+	</update>
+	<insert id="addWebsiteAccount" parameterClass="Map">
+		insert into spider_website_account(account,password,site,valid,createtime,updatetime) values
+		(#account#,#password#,#site#,#valid#,now(),now())
+		<selectKey resultClass = "int" keyProperty="id">
+			select @@identity as inserted
+		</selectKey>
+	</insert>
+</sqlMap>

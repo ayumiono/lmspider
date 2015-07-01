@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE sqlMap
+PUBLIC "-//ibatis.apache.org//DTD SQL Map 2.0//EN"
+    "http://ibatis.apache.org/dtd/sql-map-2.dtd">
+<sqlMap namespace="spiderProxyip">
+	<typeAlias alias="spiderProxyip" type="com.lmdna.spider.dao.model.SpiderProxyIp" />
+	<typeAlias alias="spiderProxyipStatus" type="com.lmdna.spider.dao.model.SpiderProxyIpStatus" />
+	<typeAlias alias="spiderBlackProxyIp" type="com.lmdna.spider.dao.model.SpiderBlackProxyIp" />
+	<select id="selectProxyip" resultClass="spiderProxyip">
+		select * from spider_proxyip
+		<isNotNull property="startRow">
+			limit #startRow#,#pageSize#
+		</isNotNull>
+	</select>
+	<select id="getProxyipCount" resultClass="int">
+		select count(*) from spider_proxyip
+		<dynamic prepend="where">
+			<isNotNull prepend="and" property="ip">
+				ip=#ip#
+			</isNotNull>
+		</dynamic>
+	</select>
+	<select id="getProxyIps" parameterClass="Map" resultClass="spiderProxyip">
+		select * from spider_proxyip where CONCAT(ip,":",`port`) not in(
+			select CONCAT(ip,":",`port`) from spider_proxyip_blacklist 
+			<dynamic prepend="where">
+				bizid=#bizid#
+			</dynamic>
+			)
+	</select>
+	<insert id="addProxyip" parameterClass="spiderProxyip">
+		insert into spider_proxyip(ip,port,createtime,updatetime)
+		values(#ip#,#port#,now(),now())
+	</insert>
+	<delete id="deleteInvalidProxyip" parameterClass="Map">
+		delete from spider_proxyip
+		<dynamic prepend="where">
+			<isNotNull prepend="and" property="ip">            
+               ip=#ip#
+           	</isNotNull>
+			<isNotNull prepend="and" property="port">            
+               port=#port#
+           	</isNotNull>
+			<isNotNull prepend="and" property="id">            
+               id=#id#
+           	</isNotNull>
+		</dynamic>
+	</delete>
+	
+	
+	<insert id="addBlackProxyip" parameterClass="Map">
+		insert into spider_proxyip_blacklist(ip,port,bizid,reason,createtime,updatetime)
+		values(#ip#,#port#,#bizid#,#reason#,now(),now())
+	</insert>
+	
+	
+	<insert id="addProxyipStatus" parameterClass="Map" >
+		insert into spider_proxyip_status(ip,port,bizid,proxyipid,reuseinterval,machineid)
+		values(#ip#,#port#,#bizid#,#proxyipid#,#reuseinterval#,#machineid#)
+		<selectKey resultClass = "int" keyProperty="id">
+			select @@identity as inserted
+		</selectKey>
+	</insert>
+	<update id="updateProxyipStatus" parameterClass="Map">
+		update spider_proxyip_status set
+		<dynamic prepend="set">
+			<isNotNull prepend="," property="failednum">
+				failednum=#failednum#
+           	</isNotNull>
+           	<isNotNull prepend="," property="successnum">            
+               successnum=#successnum#
+           	</isNotNull>
+           	<isNotNull prepend="," property="borrownum">            
+               borrownum=#borrownum#
+           	</isNotNull>
+           	<isNotNull prepend="," property="speed">            
+               speed=#speed#
+           	</isNotNull>
+           	<isNotNull prepend="," property="deadnum">
+           		deadnum=#deadnum#
+           	</isNotNull>
+           	<isNotNull prepend="," property="reuseinterval">
+           		reuseinterval=#reuseinterval#
+           	</isNotNull>
+		</dynamic>
+		where id=#id#
+	</update>
+	
+	<delete id="deleteProxyipStatus" parameterClass="int">
+		delete spider_proxyip_status where id=#value#
+	</delete>
+</sqlMap>

@@ -1,0 +1,677 @@
+package com.lmdna.spider.node.slave;
+
+import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.lang.reflect.Constructor;
+import java.net.Inet4Address;
+import java.net.Socket;
+import java.net.UnknownHostException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import javax.management.JMException;
+
+import org.apache.commons.lang3.StringUtils;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import us.codecraft.webmagic.Request;
+import us.codecraft.webmagic.Site;
+import us.codecraft.webmagic.Spider;
+import us.codecraft.webmagic.pipeline.Pipeline;
+import us.codecraft.webmagic.processor.PageProcessor;
+
+import com.alibaba.fastjson.JSON;
+import com.lmdna.spider.boot.SpiderProcess;
+import com.lmdna.spider.dao.model.SpiderBiz;
+import com.lmdna.spider.dao.model.SpiderFieldRule;
+import com.lmdna.spider.downloader.StatusFulDownloader;
+import com.lmdna.spider.jar.utils.TaskFileParseProxyFacotry;
+import com.lmdna.spider.mongodb.MongoDBTemplate;
+import com.lmdna.spider.monitor.SpiderMonitor;
+import com.lmdna.spider.monitor.SpiderStatusMXBean;
+import com.lmdna.spider.node.SpiderNode;
+import com.lmdna.spider.node.SpiderNodeConfig;
+import com.lmdna.spider.pageprocessor.LmdnaCommonPageProcessor;
+import com.lmdna.spider.pipeline.MongoDBPipeline;
+import com.lmdna.spider.protocol.TaskFileParseProtocol;
+import com.lmdna.spider.protocol.rpc.HeartBeatService;
+import com.lmdna.spider.protocol.rpc.utils.CrawlTask;
+import com.lmdna.spider.protocol.rpc.utils.FileRequestObject;
+import com.lmdna.spider.protocol.rpc.utils.HeartBeatData;
+import com.lmdna.spider.protocol.rpc.utils.SpiderStatusSerialization;
+import com.lmdna.spider.utils.SpiderConfig;
+
+/**
+ * @author ayumiono
+ *spider slave节点类
+ *slave节点组件包括一个spider线程池、工作线程池（任务扫描线程、心跳发送线程）
+ *version1.0.0:新增一个jetty server来处理远程控制请求
+ */
+public class FollowerNode extends SpiderNode{
+	
+	private static final Logger logger = LoggerFactory.getLogger(SpiderProcess.class);
+	private ExecutorService spider_pool;
+	private ExecutorService worker;
+	private SpiderMonitor monitor = SpiderMonitor.instance();
+	private Map<String, Spider> spiders;
+	private Map<String, Spider> shutdownSpiders;
+	private BlockingQueue<Request> reqQueue;
+	
+	private Map<String,ClassLoader> classLoaderCache;//bizcode - classloader
+	private Map<String,TaskFileParseProtocol> taskFileParserCache;//bizcode - taskFileParser
+	private Map<String,String> taskFilePathCache;//taskid-taskfilepath
+	private Map<String,String> jarFilePathCache;//bizcode-jarfilepath
+	
+	private HeartBeatService heartBeatProtocol;//心跳接口
+	private String fileServerHost;
+	private int fileServerPort;
+	
+	private BlockingQueue<LocalCrawlTask> crawlTaskQueue;
+	
+	public FollowerNode(SpiderNodeConfig _config){
+		this._config = _config;
+	}
+	
+	private void initComponent(){
+		logger.info("Slave Node:start to initialize spider component...");
+		try {
+			this.heartBeatProtocol = (HeartBeatService) _config.getParameter("heartbeat.protocol");
+			this.fileServerHost = (String) _config.getParameter("master.fileserver.host");
+			this.fileServerPort = (Integer) _config.getParameter("master.fileserver.port");
+			
+			this.spider_pool = Executors.newFixedThreadPool(Integer.parseInt(SpiderConfig.getValue("spider.pool.size")),new SpiderFactory());//spider线程池
+			this.spiders = new ConcurrentHashMap<String, Spider>();
+			this.shutdownSpiders = new ConcurrentHashMap<String, Spider>();
+			this.worker = Executors.newFixedThreadPool(Integer.parseInt(SpiderConfig.getValue("spider.readerpool.size")),new BatchReaderFactory());
+			this.reqQueue = new LinkedBlockingQueue<Request>(Integer.parseInt(SpiderConfig.getValue("spider.slave.reqqueue.ceiling")));// 最大50万条请求，超出50万条等待 
+			
+			this.crawlTaskQueue = new LinkedBlockingQueue<LocalCrawlTask>();
+			
+			this.classLoaderCache = new HashMap<String,ClassLoader>();
+			this.jarFilePathCache = new HashMap<String,String>();
+			this.taskFileParserCache = new HashMap<String,TaskFileParseProtocol>();
+			this.taskFilePathCache = new HashMap<String,String>();
+			
+			loadSpider();
+			logger.info("Slave Node:components initialize completed.");
+		} catch (Exception e) {
+			logger.error("SpiderSlave:components initialize failed!", e);
+		}
+	}
+	
+	private void loadSpider(){
+		if ("on".equals(SpiderConfig.getValue("spider.autoload.switch"))){
+			SpiderBiz conditionBean = new SpiderBiz();
+			conditionBean.setStatus(0);
+			Map<String,Object> querymap = new HashMap<String,Object>();
+			querymap.put("status", 0);
+			List<SpiderBiz> bizList = facade.getBizList(querymap);
+			logger.info("Slave Node:start to autoload spider...");
+			for (SpiderBiz biz : bizList) {
+				loadSpider(biz);
+			}
+		}else{
+			logger.info("Slave Node:spider.autoload.switch turned off.");
+		}
+		logger.info(String.format("SpiderSlave:spider loading completed,容器中现共有%d个spider", spiders.size()));
+	}
+	
+	public void run(){
+		initComponent();
+		this.worker.execute(new ReqQueueConsumeThread());//开启任务消费线程
+		this.worker.execute(new HeartBeatThread());//开启定时心跳线程
+	}
+	
+	private void loadSpider(SpiderBiz biz){
+		final List<SpiderFieldRule> fieldRules = facade.getFieldRuleByBizId(biz.getId());
+		try {
+			Spider spider = fixSpider(biz,fieldRules);
+			//mongodb存储方式
+			Pipeline pipeline = new MongoDBPipeline(MongoDBTemplate.Default(), biz.getPersistenceTable());
+			spider.setExitWhenComplete(false)
+				  .thread(biz.getThreadCount())
+				  .addPipeline(pipeline)
+				  .setBizcode(biz.getBizCode());
+			spider.setEmptySleepTime(30000);
+			spiders.put(biz.getBizCode(), spider);
+			logger.info("lmdna-spider:a new spider initiallization completed.");
+			try {
+				monitor.register(spider);
+			} catch (JMException e) {
+				logger.info("lmdna-spider:a new spider failed to register to the jmx！");
+				logger.error("lmdna-spider:a new spider failed to register to the jmx！");
+			}
+			spider_pool.execute(spider);
+		} catch (Exception e) {
+			return;
+		}
+	}
+	
+	/**
+	 * 给spider装配pageProcessor
+	 * @param spider
+	 * @param biz
+	 * @param antiMonitorPolicy
+	 * @param fieldRules
+	 * @throws Exception
+	 */
+	private Spider fixSpider(SpiderBiz biz,final List<SpiderFieldRule> fieldRules) throws Exception{ 
+		Spider spider = null;
+		Site siteTemp = fixSite(biz);
+		for(SpiderFieldRule fieldRule : fieldRules){
+			if(fieldRule.getAdditionRequest() == 1 || fieldRule.getAdditionDownload() == 1){
+				if(StringUtils.isNotEmpty(fieldRule.getResponseValidCheck()))
+				siteTemp.putValidCheck(Integer.valueOf(fieldRule.getId()), fieldRule.getResponseValidCheck());
+			}
+		}
+		final Site siteFinal = siteTemp;
+		PageProcessor pp = new LmdnaCommonPageProcessor(fieldRules, siteFinal);
+		//判断SpiderBiz中是否有指定的任务处理类,如果没有，则用通用的的Spider
+		if(StringUtils.isEmpty(biz.getTaskProcessClass())){
+			spider = Spider.create(pp);
+		}else{
+			Constructor<?> c = Class.forName(biz.getTaskProcessClass()).getConstructor();
+			spider = (Spider) c.newInstance();
+		}
+		if(biz.getWebsiteConfigBO().getNeedLogin() == 1){
+			spider.setDownloader(new StatusFulDownloader());
+		}
+		return spider;
+	}
+	
+	/**
+	 * 收集心跳提交数据
+	 * @return
+	 */
+	private HeartBeatData gatherHeartBeatData(){
+		HeartBeatData heartBeatData = new HeartBeatData();
+		heartBeatData.setSpiderCounts(spiders.size());
+		heartBeatData.setMemoUsage(getMemoUsage());
+		SpiderMonitor monitor = this.getMonitor();
+		List<SpiderStatusSerialization> statusSerializations = new ArrayList<SpiderStatusSerialization>();
+		int totalThreadCount = 0;
+		for(Entry<String,SpiderStatusMXBean> entry : monitor.getSpiderStatusMap().entrySet()){
+			SpiderStatusMXBean statusBean = entry.getValue();
+			SpiderStatusSerialization statusSerialization = new SpiderStatusSerialization();
+			statusSerialization.setErrorPageCount(statusBean.getErrorPageCount());
+			statusSerialization.setLeftPageCount(statusBean.getLeftPageCount());
+			statusSerialization.setMatchSuccessPageCount(statusBean.getMatchSuccessPageCount());
+			statusSerialization.setName(statusBean.getName());
+			statusSerialization.setPagePerSecond(statusBean.getPagePerSecond());
+			statusSerialization.setProxyPoolSize(statusBean.getProxyPoolSize());
+			statusSerialization.setStartTime(statusBean.getStartTime());
+			statusSerialization.setStatus(statusBean.getStatus());
+			statusSerialization.setSuccessPageCount(statusBean.getSuccessPageCount());
+			statusSerialization.setThread(statusBean.getThread());
+			statusSerialization.setTotalPageCount(statusBean.getTotalPageCount());
+			statusSerializations.add(statusSerialization);
+			totalThreadCount = totalThreadCount + statusBean.getThread();
+		}
+		heartBeatData.setSpiderInfos(statusSerializations);
+		heartBeatData.setActiveThreadCounts(totalThreadCount);
+		try {
+			heartBeatData.setIp(Inet4Address.getLocalHost().getHostAddress());
+		} catch (UnknownHostException e) {
+			logger.error("获取本机IP出错！",e);
+		}
+		return heartBeatData;
+	}
+	
+	/**
+	 * 提供http控制spiders接口：reset=remove + load
+	 * 
+	 * @param spiderId
+	 * @param bizId
+	 * @throws Exception
+	 */
+	public void reset(String bizcode) throws Exception {
+		Spider spider = spiders.get(bizcode);
+		if (spider == null) {
+			throw new Exception("没有找到对应的spider");
+		}
+		spider.stop();
+		spiders.remove(bizcode);
+	}
+
+	/**
+	 * 提供http控制spiders接口：shutdown
+	 * 
+	 * @param spiderId
+	 * @throws Exception
+	 */
+	public void shutdown(String bizcode) throws Exception {
+		
+		Spider spider = spiders.get(bizcode);
+		if (spider == null) {
+			throw new Exception("没有找到对应的spider");
+		}
+		monitor.getSpiderStatusMap().get(bizcode).stop();
+		shutdownSpiders.put(bizcode, spider);
+		spiders.remove(bizcode);
+	}
+
+	/**
+	 * 提供http控制spiders接口：start
+	 * 
+	 * @param spiderId
+	 * @throws Exception
+	 */
+	public void start(String bizcode) throws Exception {
+		Spider spider = shutdownSpiders.get(bizcode);
+		if (spider == null) {
+			throw new Exception("没有找到对应的spider");
+		}
+		spiders.put(bizcode, spider);
+		spider_pool.execute(spider);
+		shutdownSpiders.remove(bizcode);
+	}
+
+	public void remove(String bizcode) throws Exception {
+		Spider spider = spiders.get(bizcode);
+		Spider spiderCopy = shutdownSpiders.get(bizcode);
+		if (spider == null && spiderCopy == null) {
+			throw new Exception("没有找到对应的spider");
+		}
+		spider.close();
+		spiders.remove(bizcode);
+		shutdownSpiders.remove(bizcode);
+	}
+
+	public SpiderMonitor getMonitor(){
+		return monitor;
+	}
+	
+	
+	/**
+	 * 文件下载请求
+	 * @author ayumiono
+	 */
+	class FileClient implements Runnable {
+		
+		private FileRequestObject fileRequest;
+		
+		private String fileServerHost;
+		private int fileServerPort;
+
+		public FileClient(String fileServerHost, int fileServerPort, FileRequestObject fileRequest) {
+			this.fileServerHost = fileServerHost;
+			this.fileServerPort = fileServerPort;
+			this.fileRequest = fileRequest;
+		}
+
+		@Override
+		public void run() {
+			try {
+				Socket socket = new Socket(fileServerHost, fileServerPort);
+				DataInputStream dis = new DataInputStream(socket.getInputStream());
+				DataOutputStream dos = new DataOutputStream(
+						socket.getOutputStream());
+				dos.writeInt(fileRequest.getFilePath().getBytes().length);
+				dos.write(fileRequest.getFilePath().getBytes());
+				dos.writeInt(fileRequest.getFileName().getBytes().length);
+				dos.write(fileRequest.getFileName().getBytes());
+				if("jar".equals(fileRequest.getType())){
+					File tempDir = new File(_config.getJarFileDir());
+					ensureDirectory(tempDir);
+					File file = new File(tempDir,fileRequest.getFileName());
+					DataOutputStream fileOut = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(file)));
+					int len = 0;
+					byte[] buf = new byte[1024];
+					//读取文件字节数,校验文件完整性
+					int file_bytes_check = dis.readInt();
+					int file_bytes = 0;
+					while ((len = dis.read(buf)) != -1) {
+						fileOut.write(buf, 0, len);
+						file_bytes = file_bytes + len;
+						logger.info("file_bytes:"+file_bytes);
+					}
+					logger.info("file_bytes_check:"+file_bytes_check);
+					if(file_bytes == file_bytes_check){
+						logger.info(fileRequest.getFileName()+"文件下载完成");
+					}else{
+						System.out.println(fileRequest.getFileName()+":file_bytes_check:"+file_bytes_check+"file_bytes:"+file_bytes);
+					}
+					
+					fileOut.close();
+					dos.close();
+					dis.close();
+					socket.close();
+					jarFilePathCache.put(fileRequest.getBizCode(), file.getPath());
+				}else if("task".equals(fileRequest.getType())){
+					File tempDir = new File(_config.getTaskFileDir());
+					ensureDirectory(tempDir);
+					File file = new File(tempDir,fileRequest.getFileName());
+					DataOutputStream fileOut = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(file)));
+					int len = 0;
+					byte[] buf = new byte[1024];
+					//读取文件字节数,校验文件完整性
+					int file_bytes_check = dis.readInt();
+					int file_bytes = 0;
+					while ((len = dis.read(buf)) != -1) {
+						fileOut.write(buf, 0, len);
+						file_bytes = file_bytes + len;
+						logger.info("file_bytes:"+file_bytes);
+					}
+					if(file_bytes == file_bytes_check){
+						logger.info(fileRequest.getFileName()+"文件下载完成");
+					}else{
+						System.out.println(fileRequest.getFileName()+":file_bytes_check:"+file_bytes_check+"file_bytes:"+file_bytes);
+					}
+					fileOut.close();
+					dos.close();
+					dis.close();
+					socket.close();
+					taskFilePathCache.put(fileRequest.getTaskId(), file.getPath());
+				}
+				fileRequest.finished();
+			} catch (UnknownHostException e) {
+				e.printStackTrace();
+			} catch (IOException e) {
+				e.printStackTrace();
+			}
+		}
+		
+		private void ensureDirectory(File dir) throws IOException {
+			if (!dir.mkdirs() && !dir.isDirectory()) {
+				throw new IOException("Mkdirs failed to create " + dir.toString());
+			}
+		}
+	}
+	
+	/**
+	 * 任务队列消费线程
+	 */
+	class ReqQueueConsumeThread implements Runnable{
+		@Override
+		public void run() {
+			for(;;){
+				Request req = null;
+				try {
+					req = reqQueue.take();
+					String bizcode = (String) req.getExtra("bizcode");
+					try{
+						if(spiders.containsKey(bizcode)){
+							spiders.get(bizcode).addRequest(req);
+						}else{
+							//不做任何处理
+						}
+					}catch(IllegalStateException e){
+						if(e.getMessage().equalsIgnoreCase("queue full")){
+							logger.warn("spider>>>{}---任务处理失败，任务池已满!",bizcode);
+							try{
+								reqQueue.add(req);//如果Spider中任务队列溢出，默认是Integer.Max，则归还任务.
+							}catch(IllegalStateException e2){
+								if(e.getMessage().equalsIgnoreCase("queue full")){
+									continue;//如果连reqQueue也满了，那只能放弃该任务
+								}
+							}
+						}else{
+							logger.error("spider>>>{}---任务提交失败！",bizcode);
+						}
+					}
+				} catch (InterruptedException e) {
+					logger.info("爬虫任务消费线程异常中断！");
+					logger.error("爬虫任务消费线程异常中断！");
+				} catch(Exception e){
+					logger.error(e.getMessage(),e);
+				}
+			}
+		}
+	}
+	
+	/**
+	 * 心跳线程
+	 */
+	class HeartBeatThread implements Runnable{
+		@Override
+		public void run() {
+			for(;;){
+				try{
+					List<CrawlTask> acceptTasks = heartBeatProtocol.handleHeartBeat(gatherHeartBeatData());
+					if(acceptTasks!=null && acceptTasks.size()>0){
+						//任务本地化
+						for(CrawlTask acceptTask : acceptTasks){
+							List<FileRequestObject> downloadFileWatcher = new ArrayList<FileRequestObject>();
+							//没有对应taskid的任务文件路径，则说明这是第一次执行该任务文件，需要下载
+							if(taskFilePathCache.get(acceptTask.getTaskId()) == null){
+								FileRequestObject fileRequestObject = new FileRequestObject();
+								fileRequestObject.setType("task");
+								fileRequestObject.setTaskId(acceptTask.getTaskId());
+								fileRequestObject.setBizCode(acceptTask.getBizCode());
+								fileRequestObject.setFilePath(acceptTask.getTaskFilePath());
+								fileRequestObject.setFileName(acceptTask.getTaskFileName());
+								new Thread(new FileClient(fileServerHost,fileServerPort,fileRequestObject)).start();
+								downloadFileWatcher.add(fileRequestObject);
+							}
+							if(acceptTask.isNeedload()){
+								FileRequestObject fileRequestObject = new FileRequestObject();
+								fileRequestObject.setType("jar");
+								fileRequestObject.setTaskId(acceptTask.getTaskId());
+								fileRequestObject.setBizCode(acceptTask.getBizCode());
+								fileRequestObject.setFilePath(acceptTask.getJarFilePath());
+								fileRequestObject.setFileName(acceptTask.getJarFileName());
+								new Thread(new FileClient(fileServerHost,fileServerPort,fileRequestObject)).start();
+								downloadFileWatcher.add(fileRequestObject);
+							}
+							
+							LocalCrawlTask localCrawlTask = new LocalCrawlTask();
+							localCrawlTask.setNeedload(acceptTask.isNeedload());
+							localCrawlTask.setBizCode(acceptTask.getBizCode());
+							localCrawlTask.setTaskId(acceptTask.getTaskId());
+							localCrawlTask.setStartRow(acceptTask.getStart());
+							localCrawlTask.setEndRow(acceptTask.getEnd());
+							new Thread(new LocalCrawlTaskParseThread(localCrawlTask,downloadFileWatcher.toArray(new FileRequestObject[0]))).start();
+						}
+					}
+				}catch(Exception e){
+					
+				}
+				try {
+					Thread.sleep(Long.parseLong(SpiderConfig.getValue("spider.slave.heartbeat.interval")));
+				} catch (NumberFormatException e) {
+					e.printStackTrace();
+				} catch (InterruptedException e) {
+					logger.info("心跳睡眠线程中断。");
+				}
+			}
+		}
+	}
+	
+	class LocalCrawlTaskParseThread implements Runnable{
+
+		private LocalCrawlTask localCrawlTask;
+		
+		private List<FileRequestObject> locks;
+		
+		public LocalCrawlTaskParseThread(LocalCrawlTask localCrawlTask,FileRequestObject... o){
+			this.localCrawlTask = localCrawlTask;
+			if(o!=null && o.length>0){
+				locks = Arrays.asList(o);
+			}
+		}
+		
+		@Override
+		public void run() {
+			for(FileRequestObject watcher : locks){
+				for(;;){
+					if(watcher.isFinished()){
+						break;
+					}
+				}
+			}
+			//如果需要从jar包中加载spider
+			String jarfilepath = jarFilePathCache.get(localCrawlTask.getBizCode());
+			String taskfilepath = taskFilePathCache.get(localCrawlTask.getTaskId());
+			if(localCrawlTask.isNeedload()){
+				try {
+					ClassLoader loader = newClassLoader(jarfilepath);
+					classLoaderCache.put(localCrawlTask.getBizCode(), loader);
+					String spider_process_name = getSpiderClassFromJarName(jarfilepath);
+					SpiderBiz biz = SpiderNode.parseBizBeanFromXml(jarfilepath);
+					Thread.currentThread().setContextClassLoader(loader);
+				    Site site = SpiderNode.fixSite(biz);
+				    Constructor<?> c;
+					c = Class.forName(spider_process_name,true,loader).getConstructor();
+					Spider spider = (Spider) c.newInstance();
+					spider.setSite(site);
+					if(biz.getWebsiteConfigBO().getNeedLogin() == 1){
+						spider.setDownloader(new StatusFulDownloader());
+					}
+					spider.setExitWhenComplete(false).thread(biz.getThreadCount()).setBizcode(biz.getBizCode());
+					spider.setEmptySleepTime(30000);
+					spiders.put(localCrawlTask.getBizCode(), spider);
+					logger.info("lmdna-spider:实例新的spider,成功!");
+					try {
+						monitor.register(spider);
+					} catch (JMException e) {
+						logger.info("新的spider注册到jmx平台时失败！");
+						logger.error("新的spider注册到jmx平台时失败！");
+					}
+					spider_pool.execute(spider);
+				} catch (Throwable e) {
+					e.printStackTrace();
+				}
+				try{
+					TaskFileParseProtocol fileParser = null;
+					String taskFilePaserClassName = getTaskFileParseClassFromJarName(jarfilepath);
+					//开始解析任务文件（可以自定义任务文件解析器）
+					if(taskFilePaserClassName!=null){
+						TaskFileParseProxyFacotry fileParseFactory = new TaskFileParseProxyFacotry(classLoaderCache.get(localCrawlTask.getBizCode()));
+						fileParser = (TaskFileParseProtocol)fileParseFactory.create((TaskFileParseProtocol)Class.forName(taskFilePaserClassName,true,classLoaderCache.get(localCrawlTask.getBizCode())).getConstructor().newInstance(), reqQueue);
+					}else{
+						TaskFileParseProxyFacotry fileParseFactory = new TaskFileParseProxyFacotry();
+						fileParser = (TaskFileParseProtocol) fileParseFactory.create(reqQueue);
+					}
+					taskFileParserCache.put(localCrawlTask.getBizCode(), fileParser);
+				}catch(IOException e){
+					logger.error("任务文件解析失败！",e);
+				} catch (Throwable e) {
+					e.printStackTrace();
+				}
+			}
+			//解析任务文件
+			TaskFileParseProtocol fileParser = taskFileParserCache.get(localCrawlTask.getBizCode());
+			try {
+				fileParser.parse(new FileInputStream(new File(taskfilepath)), localCrawlTask.getStartRow(), localCrawlTask.getEndRow());
+			} catch (FileNotFoundException e) {
+				e.printStackTrace();
+			} catch (IOException e) {
+				e.printStackTrace();
+			}
+		}
+	}
+	
+	/**
+	 * 接收hessian远程任务
+	 * @param reqJSON
+	 * @return
+	 */
+	public String acceptRequest(String reqJSON){
+		Request req;
+		try{
+			req = JSON.parseObject(reqJSON,Request.class);
+		}catch(Exception e){
+			return String.format("{'code':'402','msg':'参数格式不正确！','error':%s}", e.getMessage());
+		}
+		try{
+			reqQueue.add(req);
+			return  String.format("{'code':'200','msg':'抓取请求提交成功！'}");
+		}catch(IllegalStateException e){
+			if(e.getMessage().equalsIgnoreCase("Queue Full")){
+				return String.format("{'code':'401','msg':'抓取队列已满(%d)！为了避免后台内存泄露请稍后重试！','error':%s}",reqQueue.size(),e.getMessage());
+			}else{
+				return String.format("{'code':'400','msg':'抓取请求提交失败！','error':%s}",e.getMessage());
+			}
+		}catch(Exception e){
+			return String.format("{'code':'400','msg':'抓取请求提交失败！','error':%s}",e.getMessage());
+		}
+	}
+	
+	/**
+     * The default thread factory
+     */
+    static class SpiderFactory implements ThreadFactory {
+        static final AtomicInteger poolNumber = new AtomicInteger(1);
+        final ThreadGroup group;
+        final AtomicInteger threadNumber = new AtomicInteger(1);
+        final String namePrefix;
+
+        SpiderFactory() {
+            SecurityManager s = System.getSecurityManager();
+            group = (s != null)? s.getThreadGroup() :
+                                 Thread.currentThread().getThreadGroup();
+            namePrefix = "spiderpool-" +
+                          poolNumber.getAndIncrement() +
+                         "-spider";
+        }
+
+        public Thread newThread(Runnable r) {
+            Thread t = new Thread(group, r,
+                                  namePrefix + threadNumber.getAndIncrement(),
+                                  0);
+            if (t.isDaemon())
+                t.setDaemon(false);
+            if (t.getPriority() != Thread.NORM_PRIORITY)
+                t.setPriority(Thread.NORM_PRIORITY);
+            return t;
+        }
+    }
+    
+    /**
+     * The default thread factory
+     */
+    static class BatchReaderFactory implements ThreadFactory {
+        static final AtomicInteger poolNumber = new AtomicInteger(1);
+        final ThreadGroup group;
+        final AtomicInteger threadNumber = new AtomicInteger(1);
+        final String namePrefix;
+
+        BatchReaderFactory() {
+            SecurityManager s = System.getSecurityManager();
+            group = (s != null)? s.getThreadGroup() :
+                                 Thread.currentThread().getThreadGroup();
+            namePrefix = "readerpool-" +
+                          poolNumber.getAndIncrement() +
+                         "-reader-";
+        }
+
+        public Thread newThread(Runnable r) {
+            Thread t = new Thread(group, r,
+                                  namePrefix + threadNumber.getAndIncrement(),
+                                  0);
+            if (t.isDaemon())
+                t.setDaemon(false);
+            if (t.getPriority() != Thread.NORM_PRIORITY)
+                t.setPriority(Thread.NORM_PRIORITY);
+            return t;
+        }
+    }
+
+	@Override
+	public void close() {
+		if(spider_pool!=null){
+			spider_pool.shutdownNow();
+		}
+		if(worker!=null){
+			worker.shutdownNow();
+		}
+	}
+}

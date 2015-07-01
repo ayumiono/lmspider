@@ -1,0 +1,78 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE sqlMap
+PUBLIC "-//ibatis.apache.org//DTD SQL Map 2.0//EN"
+    "http://ibatis.apache.org/dtd/sql-map-2.dtd">
+<sqlMap namespace="spiderBiz">
+	<typeAlias alias="spiderBiz" type="com.lmdna.spider.dao.model.SpiderBiz" />
+	<resultMap id="BizResult" class="spiderBiz">
+		<result property="id" column="id"/>   
+  		<result property="bizCode" column="bizcode"/>   
+  		<result property="bizName" column="bizname"/>   
+  		<result property="urlRule" column="urlrule"/>
+  		<result property="persistenceTable" column="persistencetable"/>   
+  		<result property="editFlag" column="editflag"/>
+  		<result property="status" column="status"/>
+  		<result property="threadCount" column="threadcount"/>
+  		<result property="responseValidCheck" column="responsevalidcheck"/>   
+  		<result property="taskProcessClass" column="taskprocessclass"/>
+  		<result property="createTime" column="createtime"/>
+  		<result property="updateTime" column="updatetime"/>
+  		<result property="websiteConfigBO" column="websiteconfig" select="spiderWebsiteConfig.getWebsiteConfigById"/>
+		<result property="fieldRules" column="id" select="spiderFieldRule.getFieldRuleBybizID" />
+	</resultMap>
+	
+	<select id="selectAllBiz" resultClass="spiderBiz">
+		select * from spider_biz
+	</select>
+	<select id="selectBizById" parameterClass="int" resultMap="BizResult">
+		select * from spider_biz where id=#id#
+	</select>
+	<select id="selectBizs" parameterClass="Map" resultMap="BizResult">
+		select * from spider_biz
+		<dynamic prepend="where">
+			<isNotNull property="status" prepend="and">
+				status=#status#
+			</isNotNull>
+			<isNotNull property="bizCode" prepend="and">
+				bizcode=#bizCode#
+			</isNotNull>
+			<isNotNull property="bizName" prepend="and">
+				bizname=#bizName#
+			</isNotNull>
+		</dynamic>
+		<isNotNull property="startRow">
+			limit #startRow#,10
+		</isNotNull>
+	</select>
+	<select id="selectBizByCode" parameterClass="String" resultClass="spiderBiz">
+		select * from spider_biz where code like '%$name$%'
+	</select>
+	<select id="getBizCount" parameterClass="Map" resultClass="int">
+		select count(*) from spider_biz
+		<dynamic prepend="where">
+			<isNotNull property="status" prepend="and">
+				status=#status#
+			</isNotNull>
+		</dynamic>
+	</select>
+	
+	<insert id="addBiz" parameterClass="spiderBiz">
+		insert into spider_biz(bizcode,bizname,urlrule,persistencetable,websiteconfig,createtime,updatetime) values
+		(#bizCode#,#bizName#,#urlRule#,#persistenceTable#,#websiteConfig#,now(),now())
+		<selectKey resultClass = "int" keyProperty="id">
+			select @@identity as inserted
+		</selectKey>
+	</insert>
+	<delete id = "deleteBizById" parameterClass="int">
+		delete from spider_biz where id=#id#
+	</delete>
+	<update id = "updateBiz" parameterClass="spiderBiz">
+	update spider_biz set 
+	bizcode=#bizCode#,
+	bizname=#bizName#,
+	urlrule=#urlRule#,
+	persistencetable=#persistenceTable#,
+	updatetime=now()
+	where id=#id#
+	</update>
+</sqlMap>

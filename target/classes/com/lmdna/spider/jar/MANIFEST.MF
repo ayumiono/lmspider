@@ -1,0 +1,3 @@
+Manifest-Version: 1.0
+Spider-Class: com.lmdna.spider.jar.TencentIndividualInfoCrawlTask
+Spider-TaskFile-Parser: com.lmdna.spider.jar.TencentIndividualInfoTaskPaser

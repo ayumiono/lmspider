@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE sqlMap
+PUBLIC "-//ibatis.apache.org//DTD SQL Map 2.0//EN"
+    "http://ibatis.apache.org/dtd/sql-map-2.dtd">
+<sqlMap namespace="spiderVerifyImg">
+	<typeAlias alias="spiderVerifyImg" type="com.lmdna.spider.dao.model.SpiderVerifyImg" />
+	<select id="selectVerifyImgByid" parameterClass="Long" resultClass="spiderVerifyImg">
+		select * from spider_verify_images where id=#value#
+	</select>
+	<insert id="addVerifyImg" parameterClass="Map">
+		insert into spider_verify_images(host,from,url,imgcreatetime,createtime,updatetime)
+		values(#host#,#from#,#url#,#imgcreatetime#,now(),now())
+	</insert>
+	<select id="selectVerifyImgs" resultClass="spiderVerifyImg">
+		select * from spider_verify_images limit 0,50
+	</select>
+	<delete id="deleteVerifyImg" parameterClass="Long">
+		delete spider_verify_images where id=#value#
+	</delete>
+	<update id="submitVerifyCode" parameterClass="Map">
+		update spider_verify_images set verifycode=#verifycode# where id=#id#
+	</update>
+</sqlMap>

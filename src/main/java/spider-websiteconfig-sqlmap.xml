@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE sqlMap
+PUBLIC "-//ibatis.apache.org//DTD SQL Map 2.0//EN"
+    "http://ibatis.apache.org/dtd/sql-map-2.dtd">
+<sqlMap namespace="spiderWebsiteConfig">
+	<typeAlias alias="spiderWebsiteConfig" type="com.lmdna.spider.dao.model.SpiderWebsiteConfig" />
+	<typeAlias alias="spiderWebsite" type="com.lmdna.spider.dao.model.SpiderWebsite" />
+	<resultMap id="websiteConfigResult" class="spiderWebsiteConfig">
+		<result property="id" column="id"/>   
+  		<result property="needProxy" column="needproxy"/>   
+  		<result property="ipReuseInterval" column="ipreuseinterval"/>   
+  		<result property="ipStatReportInterval" column="ipstatreportinterval"/>
+  		<result property="ipReviveinTime" column="ipreviveintime"/>   
+  		<result property="failedTimes" column="failedtimes"/>
+  		<result property="retryTimes" column="retrytimes"/>   
+  		<result property="cycleRetryTimes" column="cycleretrytimes"/>
+  		<result property="proxyIpCount" column="proxyipcount"/>   
+  		<result property="proxyIpLoadCount" column="proxyiploadcount"/>
+  		<result property="deadTimes" column="deadtimes"/>   
+  		<result property="sleepTime" column="sleeptime"/>
+  		<result property="needLogin" column="needlogin"/>   
+  		<result property="loginClass" column="loginclass"/>   
+  		<result property="accountCount" column="accountcount"/>   
+  		<result property="accountLoadCount" column="accountloadcount"/>
+  		<result property="accountReuseInterval" column="accountreuseinterval"/>   
+  		<result property="maxVisitPerAccount" column="maxvisitperaccount"/>
+  		<result property="maxVisitPerIp" column="maxvisitperip"/>   
+  		<result property="createTime" column="createtime"/>   
+  		<result property="updateTime" column="updatetime"/>
+  		<result property="websiteBO" column="website" select="spiderWebsite.getWebsiteById"/>
+	</resultMap>
+	<select id="getWebsiteConfigById" parameterClass="int" resultMap="websiteConfigResult">
+		select * from spider_website_config where id=#value#
+	</select>
+	<insert id="addWebsiteConfig" parameterClass="spiderWebsiteConfig">
+		insert into spider_website_config(website,needproxy,ipreuseinterval,ipstatreportinterval,ipreviveintime,retrytimes,cycleretrytimes,failedtimes,proxyipcount,proxyiploadcount,deadtimes,sleeptime,needlogin,loginclass,accountcount,accountloadcount,accountreuseinterval,maxvisitperaccount,maxvisitperip,createtime,updatetime) values
+		(#website#,ifnull(#needProxy#,0),#ipReuseInterval#,#ipStatReportInterval#,#ipReviveinTime#,#retryTimes#,#cycleRetryTimes#,#failedTimes#,#proxyIpCount#,#proxyIpLoadCount#,#deadTimes#,#sleepTime#,ifnull(#needLogin#,0),#loginClass#,#accountCount#,#accountLoadCount#,#accountReuseInterval#,#maxVisitPerAccount#,#maxVisitPerIp#,now(),now())
+		<selectKey resultClass = "int" keyProperty="id">
+			select @@identity as inserted
+		</selectKey>
+	</insert>
+</sqlMap>

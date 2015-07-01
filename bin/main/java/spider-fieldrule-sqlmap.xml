@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE sqlMap
+PUBLIC "-//ibatis.apache.org//DTD SQL Map 2.0//EN"
+    "http://ibatis.apache.org/dtd/sql-map-2.dtd">
+<sqlMap namespace="spiderFieldRule">
+	<typeAlias alias = "spiderFieldRule" type="com.lmdna.spider.dao.model.SpiderFieldRule" />
+	<select id="getFieldRuleBybizID" parameterClass="int" resultClass="spiderFieldRule">
+		select * from spider_field_rule where bizid=#bizid#
+	</select>
+	<insert id="addFieldRule" parameterClass="spiderFieldRule">
+		insert into spider_field_rule(bizid,fieldname,rule,type,additiondownload,additionrequest,parentid,allowempty,needpersistence,responsevalidcheck,createtime,lastmodifytime) values
+		(#bizId#,#fieldName#,#rule#,#type#,#additionDownload#,#additionRequest#,#parentId#,#allowEmpty#,#needPersistence#,#responseValidCheck#,now(),now())
+		<selectKey resultClass = "int" keyProperty="id">
+			select @@identity as inserted
+		</selectKey>
+	</insert>
+</sqlMap>
